@@ -30,7 +30,7 @@ export async function OPTIONS() {
 }
 
 // ------------------
-// Dependency resolver (DAG-safe)
+// DAG dependency resolver
 // ------------------
 function resolveExecutionOrder(teamWork) {
   const visited = new Set();
@@ -42,7 +42,7 @@ function resolveExecutionOrder(teamWork) {
 
     const deps = teamWork[team]?.depends_on || [];
     deps.forEach(dep => {
-      if (teamWork[dep]) visit(dep); // ✅ SAFE GUARD
+      if (teamWork[dep]) visit(dep);
     });
 
     order.push(team);
@@ -55,10 +55,33 @@ function resolveExecutionOrder(teamWork) {
 // ------------------
 // Scheduling helpers
 // ------------------
+function calculateEndDate(startDate, effortHours) {
+  const days = Math.max(1, Math.ceil(effortHours / 8));
+  const end = new Date(startDate);
+  end.setDate(end.getDate() + days);
+  return end;
+}
+
+function findNextAvailableStart(assignments, memberId, proposedStart) {
+  const conflicts = assignments
+    .filter(a =>
+      a.member_id === memberId &&
+      a.status === "committed" &&
+      new Date(a.end_date) >= proposedStart
+    )
+    .sort((a, b) => new Date(a.end_date) - new Date(b.end_date));
+
+  if (conflicts.length === 0) return proposedStart;
+
+  const last = conflicts[conflicts.length - 1];
+  const next = new Date(last.end_date);
+  next.setDate(next.getDate() + 1);
+  return next;
+}
+
 function getEarliestStart(team, teamWork, plan, taskStart) {
   const deps = teamWork[team]?.depends_on || [];
-
-  const validDeps = deps.filter(d => plan[d]); // ✅ SAFE FILTER
+  const validDeps = deps.filter(d => plan[d]);
 
   if (validDeps.length === 0) {
     return new Date(taskStart);
@@ -69,28 +92,12 @@ function getEarliestStart(team, teamWork, plan, taskStart) {
   );
 }
 
-function calculateEndDate(startDate, effortHours) {
-  const days = Math.max(1, Math.ceil(effortHours / 8));
-  const end = new Date(startDate);
-  end.setDate(end.getDate() + days);
-  return end;
-}
-
-function hasConflict(assignments, memberId, start, end) {
-  return assignments.some(a =>
-    a.member_id === memberId &&
-    a.status === "committed" &&
-    new Date(a.start_date) <= end &&
-    new Date(a.end_date) >= start
-  );
-}
-
 // ------------------
 // ANALYZE TASK
 // ------------------
 export async function POST(request, { params }) {
   try {
-    // ✅ FIX 1: Await params
+    // Next.js App Router params are async
     const { id: taskId } = await params;
 
     if (!taskId) {
@@ -135,14 +142,14 @@ export async function POST(request, { params }) {
       .eq("status", "committed");
 
     const teamWork = task.team_work || {};
-    const plan = {};
     const executionOrder = resolveExecutionOrder(teamWork);
+    const plan = {};
 
-    // 4️⃣ DAG scheduling
+    // 4️⃣ Schedule teams (auto-shift enabled)
     for (const team of executionOrder) {
       const work = teamWork[team];
 
-      const startDate = getEarliestStart(
+      const baseStart = getEarliestStart(
         team,
         teamWork,
         plan,
@@ -154,17 +161,29 @@ export async function POST(request, { params }) {
       const candidates = [primary, ...secondary].filter(Boolean);
 
       let assigned = null;
+      let startDate = null;
       let endDate = null;
+      let shifted = false;
 
       for (const memberId of candidates) {
-        const tentativeEnd = calculateEndDate(
-          startDate,
+        let candidateStart = baseStart;
+
+        candidateStart = findNextAvailableStart(
+          assignments,
+          memberId,
+          candidateStart
+        );
+
+        const candidateEnd = calculateEndDate(
+          candidateStart,
           work.effort_hours
         );
 
-        if (!hasConflict(assignments, memberId, startDate, tentativeEnd)) {
+        if (candidateEnd <= new Date(task.required_by)) {
           assigned = memberId;
-          endDate = tentativeEnd;
+          startDate = candidateStart;
+          endDate = candidateEnd;
+          shifted = candidateStart.getTime() !== baseStart.getTime();
           break;
         }
       }
@@ -172,7 +191,7 @@ export async function POST(request, { params }) {
       if (!assigned) {
         return withCors({
           feasible: false,
-          reason: `${team} team has no available resources`,
+          reason: `${team} team cannot complete work before due date`,
           blocking_team: team
         });
       }
@@ -182,21 +201,15 @@ export async function POST(request, { params }) {
         start_date: startDate.toISOString(),
         end_date: endDate.toISOString(),
         effort_hours: work.effort_hours,
-        depends_on: work.depends_on || []
+        depends_on: work.depends_on || [],
+        auto_shifted: shifted
       };
     }
 
-    // 5️⃣ Final delivery check
+    // 5️⃣ Final delivery date
     const estimatedDelivery = new Date(
       Math.max(...Object.values(plan).map(p => new Date(p.end_date).getTime()))
     );
-
-    if (estimatedDelivery > new Date(task.required_by)) {
-      return withCors({
-        feasible: false,
-        reason: "Cannot meet required by date"
-      });
-    }
 
     return withCors({
       feasible: true,
