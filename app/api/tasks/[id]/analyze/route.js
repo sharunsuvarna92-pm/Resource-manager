@@ -30,14 +30,42 @@ export async function OPTIONS() {
 }
 
 // ------------------
-// Helper functions
+// Dependency resolver (DAG-safe)
+// ------------------
+function resolveExecutionOrder(teamWork) {
+  const visited = new Set();
+  const order = [];
+
+  function visit(team) {
+    if (visited.has(team)) return;
+    visited.add(team);
+
+    const deps = teamWork[team]?.depends_on || [];
+    deps.forEach(dep => {
+      if (teamWork[dep]) visit(dep); // ✅ SAFE GUARD
+    });
+
+    order.push(team);
+  }
+
+  Object.keys(teamWork).forEach(visit);
+  return order;
+}
+
+// ------------------
+// Scheduling helpers
 // ------------------
 function getEarliestStart(team, teamWork, plan, taskStart) {
   const deps = teamWork[team]?.depends_on || [];
-  if (deps.length === 0) return new Date(taskStart);
+
+  const validDeps = deps.filter(d => plan[d]); // ✅ SAFE FILTER
+
+  if (validDeps.length === 0) {
+    return new Date(taskStart);
+  }
 
   return new Date(
-    Math.max(...deps.map(d => new Date(plan[d].end_date).getTime()))
+    Math.max(...validDeps.map(d => new Date(plan[d].end_date).getTime()))
   );
 }
 
@@ -60,15 +88,10 @@ function hasConflict(assignments, memberId, start, end) {
 // ------------------
 // ANALYZE TASK
 // ------------------
-export async function POST(request, context) {
+export async function POST(request, { params }) {
   try {
-    // ✅ Bullet-proof task ID resolution
-    let taskId = context?.params?.id;
-
-    if (!taskId) {
-      const urlParts = new URL(request.url).pathname.split("/");
-      taskId = urlParts[urlParts.indexOf("tasks") + 1];
-    }
+    // ✅ FIX 1: Await params
+    const { id: taskId } = await params;
 
     if (!taskId) {
       return withCors(
@@ -78,13 +101,13 @@ export async function POST(request, context) {
     }
 
     // 1️⃣ Fetch task
-    const { data: task, error: taskErr } = await supabase
+    const { data: task } = await supabase
       .from("tasks")
       .select("*")
       .eq("id", taskId)
       .single();
 
-    if (taskErr || !task) {
+    if (!task) {
       return withCors(
         { feasible: false, reason: "Task not found" },
         404
@@ -92,13 +115,13 @@ export async function POST(request, context) {
     }
 
     // 2️⃣ Fetch module ownership
-    const { data: moduleData, error: moduleErr } = await supabase
+    const { data: moduleData } = await supabase
       .from("modules")
       .select("primary_roles_map, secondary_roles_map")
       .eq("id", task.module_id)
       .single();
 
-    if (moduleErr || !moduleData) {
+    if (!moduleData) {
       return withCors(
         { feasible: false, reason: "Module not found" },
         404
@@ -106,19 +129,19 @@ export async function POST(request, context) {
     }
 
     // 3️⃣ Fetch committed assignments only
-    const { data: assignments } = await supabase
+    const { data: assignments = [] } = await supabase
       .from("assignments")
       .select("*")
       .eq("status", "committed");
 
-    const plan = {};
     const teamWork = task.team_work || {};
+    const plan = {};
+    const executionOrder = resolveExecutionOrder(teamWork);
 
-    // 4️⃣ DAG-based scheduling (parallel allowed)
-    for (const team of Object.keys(teamWork)) {
+    // 4️⃣ DAG scheduling
+    for (const team of executionOrder) {
       const work = teamWork[team];
 
-      // Determine earliest start
       const startDate = getEarliestStart(
         team,
         teamWork,
@@ -126,21 +149,22 @@ export async function POST(request, context) {
         task.start_date
       );
 
-      // Resolve owners
-      const primary =
-        moduleData.primary_roles_map?.[team];
-      const secondary =
-        moduleData.secondary_roles_map?.[team] || [];
-
+      const primary = moduleData.primary_roles_map?.[team];
+      const secondary = moduleData.secondary_roles_map?.[team] || [];
       const candidates = [primary, ...secondary].filter(Boolean);
 
       let assigned = null;
+      let endDate = null;
 
       for (const memberId of candidates) {
-        const endDate = calculateEndDate(startDate, work.effort_hours);
+        const tentativeEnd = calculateEndDate(
+          startDate,
+          work.effort_hours
+        );
 
-        if (!hasConflict(assignments || [], memberId, startDate, endDate)) {
+        if (!hasConflict(assignments, memberId, startDate, tentativeEnd)) {
           assigned = memberId;
+          endDate = tentativeEnd;
           break;
         }
       }
@@ -153,8 +177,6 @@ export async function POST(request, context) {
         });
       }
 
-      const endDate = calculateEndDate(startDate, work.effort_hours);
-
       plan[team] = {
         assigned_to: assigned,
         start_date: startDate.toISOString(),
@@ -164,7 +186,7 @@ export async function POST(request, context) {
       };
     }
 
-    // 5️⃣ Final delivery date (max end date across teams)
+    // 5️⃣ Final delivery check
     const estimatedDelivery = new Date(
       Math.max(...Object.values(plan).map(p => new Date(p.end_date).getTime()))
     );
@@ -176,7 +198,6 @@ export async function POST(request, context) {
       });
     }
 
-    // ✅ SUCCESS
     return withCors({
       feasible: true,
       estimated_delivery: estimatedDelivery.toISOString(),
