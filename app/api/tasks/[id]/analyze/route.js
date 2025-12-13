@@ -2,9 +2,6 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// ------------------
-// Supabase client
-// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -29,17 +26,19 @@ export async function OPTIONS() {
   return withCors({});
 }
 
-// ------------------
-// ANALYZE TASK
-// ------------------
 export async function POST(request, context) {
   try {
-    // ✅ SAFE param extraction (CRITICAL FIX)
-    const taskId = context?.params?.id;
+    // ✅ BULLETPROOF TASK ID RESOLUTION
+    let taskId = context?.params?.id;
+
+    if (!taskId) {
+      const urlParts = new URL(request.url).pathname.split("/");
+      taskId = urlParts[urlParts.indexOf("tasks") + 1];
+    }
 
     if (!taskId) {
       return withCors(
-        { feasible: false, reason: "Task ID missing in route params" },
+        { feasible: false, reason: "Task ID missing" },
         400
       );
     }
@@ -72,7 +71,7 @@ export async function POST(request, context) {
       );
     }
 
-    // 3️⃣ Fetch committed assignments ONLY
+    // 3️⃣ Fetch committed assignments
     const { data: assignments } = await supabase
       .from("assignments")
       .select("*")
@@ -81,57 +80,56 @@ export async function POST(request, context) {
     let currentDate = new Date(task.start_date);
     const plan = {};
 
-    // 4️⃣ Analyze team_work sequentially (dependency-aware)
-    for (const [teamName, work] of Object.entries(task.team_work || {})) {
-      const effortHours = work.effort_hours || 0;
-      const effortDays = Math.max(1, Math.ceil(effortHours / 8));
+    // 4️⃣ Analyze team_work sequentially
+    for (const [team, work] of Object.entries(task.team_work || {})) {
+      const effortDays = Math.max(
+        1,
+        Math.ceil((work.effort_hours || 0) / 8)
+      );
 
-      const primaryOwner =
-        moduleData.primary_roles_map?.[teamName];
+      const primary =
+        moduleData.primary_roles_map?.[team];
+      const secondary =
+        moduleData.secondary_roles_map?.[team] || [];
 
-      const secondaryOwners =
-        moduleData.secondary_roles_map?.[teamName] || [];
+      const candidates = [primary, ...secondary].filter(Boolean);
 
-      const candidates = [primaryOwner, ...secondaryOwners].filter(Boolean);
-
-      let assignedMember = null;
+      let assigned = null;
 
       for (const memberId of candidates) {
-        const hasConflict = assignments?.some(a =>
+        const conflict = assignments?.some(a =>
           a.member_id === memberId &&
           !(new Date(a.end_date) < currentDate ||
             new Date(a.start_date) > new Date(task.required_by))
         );
 
-        if (!hasConflict) {
-          assignedMember = memberId;
+        if (!conflict) {
+          assigned = memberId;
           break;
         }
       }
 
-      if (!assignedMember) {
+      if (!assigned) {
         return withCors({
           feasible: false,
-          reason: `${teamName} team has no available resources`,
-          blocking_team: teamName
+          reason: `${team} team has no available resources`,
+          blocking_team: team
         });
       }
 
       const endDate = new Date(currentDate);
       endDate.setDate(endDate.getDate() + effortDays);
 
-      plan[teamName] = {
-        assigned_to: assignedMember,
+      plan[team] = {
+        assigned_to: assigned,
         start_date: currentDate.toISOString(),
         end_date: endDate.toISOString(),
-        effort_hours: effortHours
+        effort_hours: work.effort_hours || 0
       };
 
-      // Dependency chain: next team starts after this one
       currentDate = endDate;
     }
 
-    // 5️⃣ Final delivery check
     if (currentDate > new Date(task.required_by)) {
       return withCors({
         feasible: false,
@@ -139,7 +137,6 @@ export async function POST(request, context) {
       });
     }
 
-    // ✅ SUCCESS
     return withCors({
       feasible: true,
       estimated_delivery: currentDate.toISOString(),
@@ -147,7 +144,7 @@ export async function POST(request, context) {
     });
 
   } catch (err) {
-    console.error("Analyzer error:", err);
+    console.error("Analyzer crash:", err);
     return withCors(
       { feasible: false, reason: "Internal analyzer error" },
       500
