@@ -56,24 +56,24 @@ export async function POST(request) {
       );
     }
 
-    const { data, error } = await supabase
-      .from("team_members")
-      .insert([
-        {
-          name,
-          email,
-          team_id,
-          skill_sets,
-          experience_level,
-          capacity_hours_per_week: capacity_hours_per_week ?? 40,
-          timezone: timezone ?? "Asia/Kolkata",
-          is_active: true,
-          calendar_busy_intervals: [],
-          historical_performance: null
-        }
-      ])
-      .select()
-      .single();
+   const { data, error } = await supabase
+  .from("team_members")
+  .insert([
+    {
+      name,
+      email,
+      team_id,
+      skill_sets,
+      experience_level,
+      capacity_hours_per_week: capacity_hours_per_week ?? 40,
+      timezone: timezone ?? "Asia/Kolkata",
+      is_active: true,
+      calendar_busy_intervals: []
+    }
+  ])
+  .select()
+  .single();
+
 
     if (error) {
       console.error("SUPABASE INSERT ERROR:", error);
