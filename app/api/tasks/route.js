@@ -23,8 +23,9 @@ const supabase = createClient(
 /* =====================================================
    POST /api/tasks
    - Creates task
-   - Auto-assigns PRIMARY owners
-   - Creates DRAFT assignments (not committed)
+   - Auto-assigns PRIMARY owners from module
+   - Creates DRAFT assignments
+   - Dependencies live inside team_work
 ===================================================== */
 export async function POST(request) {
   try {
@@ -63,19 +64,23 @@ export async function POST(request) {
       );
     }
 
-    /* 2️⃣ Build team_work + DRAFT assignments */
+    /* 2️⃣ Build final team_work + draft assignments */
     const finalTeamWork = {};
     const assignments = [];
 
     for (const team of teams_involved ?? []) {
       const primaryOwnerId = moduleData.primary_roles_map?.[team];
-      const effortHours = team_work?.[team]?.effort_hours ?? 0;
+      const teamConfig = team_work?.[team];
 
-      if (!primaryOwnerId) continue;
+      if (!primaryOwnerId || !teamConfig) continue;
+
+      const effortHours = teamConfig.effort_hours ?? 0;
+      const dependsOn = teamConfig.depends_on ?? [];
 
       finalTeamWork[team] = {
         primary_owner: primaryOwnerId,
-        effort_hours: effortHours
+        effort_hours: effortHours,
+        depends_on: dependsOn
       };
 
       if (effortHours > 0) {
@@ -86,7 +91,7 @@ export async function POST(request) {
           start_date,
           end_date: required_by,
           source: "auto",
-          status: "draft" // 👈 KEY CHANGE
+          status: "draft" // 👈 NOT committed
         });
       }
     }
@@ -118,7 +123,7 @@ export async function POST(request) {
       );
     }
 
-    /* 4️⃣ Insert DRAFT assignments */
+    /* 4️⃣ Insert draft assignments */
     assignments.forEach(a => (a.task_id = task.id));
 
     if (assignments.length > 0) {
@@ -138,11 +143,12 @@ export async function POST(request) {
       {
         message: "Task created with draft assignments",
         task_id: task.id,
+        team_work: finalTeamWork,
         assignments_created: assignments.length
       },
       { status: 201, headers: corsHeaders() }
     );
-  } catch {
+  } catch (err) {
     return NextResponse.json(
       { error: "Invalid request body" },
       { status: 400, headers: corsHeaders() }
@@ -152,8 +158,8 @@ export async function POST(request) {
 
 /* =====================================================
    GET /api/tasks
-   - Lists tasks
-   - Analyzer will later use assignments table
+   - Returns tasks
+   - Analyzer will use assignments separately
 ===================================================== */
 export async function GET() {
   const { data, error } = await supabase
