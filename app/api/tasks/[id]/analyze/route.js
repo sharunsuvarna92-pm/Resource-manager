@@ -2,6 +2,9 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
+// ------------------
+// Supabase client
+// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -26,9 +29,40 @@ export async function OPTIONS() {
   return withCors({});
 }
 
+// ------------------
+// Helper functions
+// ------------------
+function getEarliestStart(team, teamWork, plan, taskStart) {
+  const deps = teamWork[team]?.depends_on || [];
+  if (deps.length === 0) return new Date(taskStart);
+
+  return new Date(
+    Math.max(...deps.map(d => new Date(plan[d].end_date).getTime()))
+  );
+}
+
+function calculateEndDate(startDate, effortHours) {
+  const days = Math.max(1, Math.ceil(effortHours / 8));
+  const end = new Date(startDate);
+  end.setDate(end.getDate() + days);
+  return end;
+}
+
+function hasConflict(assignments, memberId, start, end) {
+  return assignments.some(a =>
+    a.member_id === memberId &&
+    a.status === "committed" &&
+    new Date(a.start_date) <= end &&
+    new Date(a.end_date) >= start
+  );
+}
+
+// ------------------
+// ANALYZE TASK
+// ------------------
 export async function POST(request, context) {
   try {
-    // ✅ BULLETPROOF TASK ID RESOLUTION
+    // ✅ Bullet-proof task ID resolution
     let taskId = context?.params?.id;
 
     if (!taskId) {
@@ -71,22 +105,28 @@ export async function POST(request, context) {
       );
     }
 
-    // 3️⃣ Fetch committed assignments
+    // 3️⃣ Fetch committed assignments only
     const { data: assignments } = await supabase
       .from("assignments")
       .select("*")
       .eq("status", "committed");
 
-    let currentDate = new Date(task.start_date);
     const plan = {};
+    const teamWork = task.team_work || {};
 
-    // 4️⃣ Analyze team_work sequentially
-    for (const [team, work] of Object.entries(task.team_work || {})) {
-      const effortDays = Math.max(
-        1,
-        Math.ceil((work.effort_hours || 0) / 8)
+    // 4️⃣ DAG-based scheduling (parallel allowed)
+    for (const team of Object.keys(teamWork)) {
+      const work = teamWork[team];
+
+      // Determine earliest start
+      const startDate = getEarliestStart(
+        team,
+        teamWork,
+        plan,
+        task.start_date
       );
 
+      // Resolve owners
       const primary =
         moduleData.primary_roles_map?.[team];
       const secondary =
@@ -97,13 +137,9 @@ export async function POST(request, context) {
       let assigned = null;
 
       for (const memberId of candidates) {
-        const conflict = assignments?.some(a =>
-          a.member_id === memberId &&
-          !(new Date(a.end_date) < currentDate ||
-            new Date(a.start_date) > new Date(task.required_by))
-        );
+        const endDate = calculateEndDate(startDate, work.effort_hours);
 
-        if (!conflict) {
+        if (!hasConflict(assignments || [], memberId, startDate, endDate)) {
           assigned = memberId;
           break;
         }
@@ -117,29 +153,33 @@ export async function POST(request, context) {
         });
       }
 
-      const endDate = new Date(currentDate);
-      endDate.setDate(endDate.getDate() + effortDays);
+      const endDate = calculateEndDate(startDate, work.effort_hours);
 
       plan[team] = {
         assigned_to: assigned,
-        start_date: currentDate.toISOString(),
+        start_date: startDate.toISOString(),
         end_date: endDate.toISOString(),
-        effort_hours: work.effort_hours || 0
+        effort_hours: work.effort_hours,
+        depends_on: work.depends_on || []
       };
-
-      currentDate = endDate;
     }
 
-    if (currentDate > new Date(task.required_by)) {
+    // 5️⃣ Final delivery date (max end date across teams)
+    const estimatedDelivery = new Date(
+      Math.max(...Object.values(plan).map(p => new Date(p.end_date).getTime()))
+    );
+
+    if (estimatedDelivery > new Date(task.required_by)) {
       return withCors({
         feasible: false,
         reason: "Cannot meet required by date"
       });
     }
 
+    // ✅ SUCCESS
     return withCors({
       feasible: true,
-      estimated_delivery: currentDate.toISOString(),
+      estimated_delivery: estimatedDelivery.toISOString(),
       plan
     });
 
