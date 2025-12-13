@@ -1,90 +1,100 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-/* ---------- CORS ---------- */
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  };
+/* -------------------- CORS -------------------- */
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
+function withCors(data, status = 200) {
+  return NextResponse.json(data, { status, headers: CORS_HEADERS });
 }
 
 export async function OPTIONS() {
-  return new Response(null, { status: 204, headers: corsHeaders() });
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
 }
 
+/* -------------------- SUPABASE -------------------- */
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-function addDays(dateStr, hours) {
+/* -------------------- HELPERS -------------------- */
+function addDays(startDate, hours) {
   const days = Math.ceil(hours / 8);
-  const d = new Date(dateStr);
+  const d = new Date(startDate);
   d.setDate(d.getDate() + days);
   return d.toISOString().split("T")[0];
 }
 
+/* -------------------- ANALYZER -------------------- */
 export async function POST(req, { params }) {
   const taskId = params.id;
 
-  const { data: task } = await supabase
+  /* Fetch task */
+  const { data: task, error: taskErr } = await supabase
     .from("tasks")
     .select("*")
     .eq("id", taskId)
     .single();
 
+  if (taskErr || !task) {
+    return withCors({ feasible: false, reason: "Task not found" }, 404);
+  }
+
+  /* Fetch module */
   const { data: moduleData } = await supabase
     .from("modules")
     .select("primary_roles_map, secondary_roles_map")
     .eq("id", task.module_id)
     .single();
 
-  const { data: busyAssignments } = await supabase
+  /* Fetch committed assignments */
+  const { data: committedAssignments } = await supabase
     .from("assignments")
     .select("*")
     .eq("status", "committed");
 
-  const plan = {};
   let currentDate = task.start_date;
+  const plan = {};
 
-  for (const team of Object.keys(task.team_work)) {
-    const work = task.team_work[team];
-    const candidates = [
-      moduleData.primary_roles_map?.[team],
-      ...(moduleData.secondary_roles_map?.[team] || [])
-    ].filter(Boolean);
+  /* Team dependency order comes from team_work object */
+  for (const teamName of Object.keys(task.team_work)) {
+    const effort = task.team_work[teamName]?.effort_hours || 0;
 
-    let assigned = null;
+    const primary = moduleData?.primary_roles_map?.[teamName];
+    const secondary = moduleData?.secondary_roles_map?.[teamName] || [];
+    const candidates = [primary, ...secondary].filter(Boolean);
 
-    for (const member of candidates) {
-      const clash = busyAssignments.some(a =>
-        a.member_id === member &&
+    let selectedMember = null;
+
+    for (const memberId of candidates) {
+      const conflict = committedAssignments.some(a =>
+        a.member_id === memberId &&
         !(a.end_date < currentDate || a.start_date > task.required_by)
       );
 
-      if (!clash) {
-        assigned = member;
+      if (!conflict) {
+        selectedMember = memberId;
         break;
       }
     }
 
-    if (!assigned) {
-      return NextResponse.json(
-        {
-          feasible: false,
-          reason: `${team} team has no available resources`,
-          blocking_team: team
-        },
-        { headers: corsHeaders() }
-      );
+    if (!selectedMember) {
+      return withCors({
+        feasible: false,
+        reason: `${teamName} team has no available resources`,
+        blocking_team: teamName
+      });
     }
 
-    const endDate = addDays(currentDate, work.effort_hours);
+    const endDate = addDays(currentDate, effort);
 
-    plan[team] = {
-      assigned_to: assigned,
+    plan[teamName] = {
+      assigned_to: selectedMember,
       start_date: currentDate,
       end_date: endDate
     };
@@ -93,21 +103,15 @@ export async function POST(req, { params }) {
   }
 
   if (currentDate > task.required_by) {
-    return NextResponse.json(
-      {
-        feasible: false,
-        reason: `Cannot meet required date. Earliest: ${currentDate}`
-      },
-      { headers: corsHeaders() }
-    );
+    return withCors({
+      feasible: false,
+      reason: `Cannot meet required date. Earliest possible: ${currentDate}`
+    });
   }
 
-  return NextResponse.json(
-    {
-      feasible: true,
-      estimated_delivery: currentDate,
-      plan
-    },
-    { headers: corsHeaders() }
-  );
+  return withCors({
+    feasible: true,
+    estimated_delivery: currentDate,
+    plan
+  });
 }
