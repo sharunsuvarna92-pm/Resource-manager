@@ -163,6 +163,7 @@ export async function GET() {
         expected_delivery_date,
         module_id,
         teams_involved,
+        team_work,
         created_at
       `)
       .order("created_at", { ascending: false });
