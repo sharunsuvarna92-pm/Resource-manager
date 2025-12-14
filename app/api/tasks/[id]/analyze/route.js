@@ -1,185 +1,139 @@
-import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import { NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+)
 
-/* ---------- CORS ---------- */
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-export async function OPTIONS() {
-  return NextResponse.json({}, { headers: corsHeaders });
+/* ---------------- CORS ---------------- */
+function cors(res) {
+  res.headers.set('Access-Control-Allow-Origin', '*')
+  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+  res.headers.set('Access-Control-Allow-Headers', 'Content-Type')
+  return res
 }
 
-/* ---------- POST /analyze ---------- */
+export async function OPTIONS() {
+  return cors(new NextResponse(null, { status: 204 }))
+}
+
+/* ---------------- ANALYZE ---------------- */
 export async function POST(req, { params }) {
   try {
-    const taskId = params?.id;
+    const { id: taskId } = params
+
     if (!taskId) {
-      return NextResponse.json(
-        { feasible: false, reason: "Task ID missing" },
-        { status: 400, headers: corsHeaders }
-      );
+      return cors(
+        NextResponse.json(
+          { feasible: false, reason: 'Task ID missing' },
+          { status: 400 }
+        )
+      )
     }
 
-    /* ---------- Fetch Task ---------- */
+    /* -------- Fetch task -------- */
     const { data: task, error: taskErr } = await supabase
-      .from("tasks")
-      .select("*")
-      .eq("id", taskId)
-      .single();
+      .from('tasks')
+      .select('*')
+      .eq('id', taskId)
+      .single()
 
     if (taskErr || !task) {
-      return NextResponse.json(
-        { feasible: false, reason: "Task not found" },
-        { status: 404, headers: corsHeaders }
-      );
+      return cors(
+        NextResponse.json(
+          { feasible: false, reason: 'Task not found' },
+          { status: 404 }
+        )
+      )
     }
 
-    const {
-      start_date,
-      due_date,
-      team_work = {},
-    } = task;
+    const taskStart = new Date(task.start_date)
+    const taskDue = new Date(task.due_date)
 
-    if (!start_date || !due_date) {
-      return NextResponse.json(
-        { feasible: false, reason: "Task dates missing" },
-        { status: 400, headers: corsHeaders }
-      );
-    }
-
-    const taskStart = new Date(start_date);
-    const taskDue = new Date(due_date);
-
-    /* ---------- Fetch committed assignments ONLY ---------- */
+    /* -------- Fetch ONLY committed assignments -------- */
     const { data: committedAssignments } = await supabase
-      .from("assignments")
-      .select("*")
-      .eq("task_id", taskId)
-      .eq("status", "Committed");
+      .from('assignments')
+      .select('*')
+      .eq('status', 'Committed')
 
-    /* ---------- Build busy map ---------- */
-    const busyMap = {};
+    /* -------- Team work is source of truth -------- */
+    const teamWork = task.team_work || {}
 
-    (committedAssignments || []).forEach(a => {
-      if (!a.member_id || !a.start_date || !a.end_date) return;
+    const plan = {}
+    let currentCursor = new Date(taskStart)
 
-      if (!busyMap[a.member_id]) busyMap[a.member_id] = [];
-      busyMap[a.member_id].push({
-        start: new Date(a.start_date),
-        end: new Date(a.end_date),
-      });
-    });
+    for (const [teamName, work] of Object.entries(teamWork)) {
+      const effortHours = work.effort_hours || 0
+      const dependsOn = work.depends_on || []
 
-    /* ---------- Helpers ---------- */
-    const addDays = (d, days) => {
-      const x = new Date(d);
-      x.setDate(x.getDate() + days);
-      return x;
-    };
-
-    const overlaps = (s1, e1, s2, e2) =>
-      s1 < e2 && s2 < e1;
-
-    const nextFreeDate = (memberId, desiredStart) => {
-      const blocks = busyMap[memberId] || [];
-      let cursor = new Date(desiredStart);
-
-      while (true) {
-        const clash = blocks.find(b =>
-          overlaps(cursor, addDays(cursor, 1), b.start, b.end)
-        );
-        if (!clash) return cursor;
-        cursor = addDays(clash.end, 1);
-      }
-    };
-
-    /* ---------- Analysis Engine ---------- */
-    const plan = {};
-    let currentCursor = new Date(taskStart);
-    let autoShifted = false;
-
-    for (const [team, info] of Object.entries(team_work)) {
-      const effortDays = Math.ceil((info.effort_hours || 1) / 8);
-      const dependsOn = info.depends_on || [];
-
-      /* dependency handling */
-      if (dependsOn.length > 0) {
-        const depEndDates = dependsOn
-          .map(d => plan[d]?.end_date)
-          .filter(Boolean)
-          .map(d => new Date(d));
-
-        if (depEndDates.length > 0) {
-          const maxDepEnd = new Date(Math.max(...depEndDates));
-          if (maxDepEnd > currentCursor) {
-            currentCursor = addDays(maxDepEnd, 1);
+      /* ----- Resolve dependency end ----- */
+      let dependencyEnd = null
+      for (const dep of dependsOn) {
+        if (plan[dep]?.end_date) {
+          const depEnd = new Date(plan[dep].end_date)
+          if (!dependencyEnd || depEnd > dependencyEnd) {
+            dependencyEnd = depEnd
           }
         }
       }
 
-      const memberId = info.assigned_to;
-      let start = currentCursor;
+      let start = dependencyEnd
+        ? new Date(dependencyEnd)
+        : new Date(currentCursor)
 
-      if (memberId && busyMap[memberId]) {
-        const free = nextFreeDate(memberId, start);
-        if (free > start) {
-          start = free;
-          autoShifted = true;
+      /* ----- Check committed conflicts ----- */
+      const teamAssignments = committedAssignments.filter(
+        a => a.team === teamName
+      )
+
+      let autoShifted = false
+      for (const a of teamAssignments) {
+        if (!a.start_date || !a.end_date) continue
+
+        const aStart = new Date(a.start_date)
+        const aEnd = new Date(a.end_date)
+
+        if (start >= aStart && start <= aEnd) {
+          start = new Date(aEnd)
+          autoShifted = true
         }
       }
 
-      const end = addDays(start, effortDays);
+      const daysNeeded = Math.max(1, Math.ceil(effortHours / 8))
+      const end = new Date(start)
+      end.setDate(end.getDate() + daysNeeded)
 
-      plan[team] = {
-        assigned_to: memberId,
+      plan[teamName] = {
+        assigned_to: work.assigned_to || null,
         start_date: start.toISOString(),
         end_date: end.toISOString(),
-        effort_hours: info.effort_hours,
+        effort_hours: effortHours,
         depends_on: dependsOn,
-        auto_shifted: autoShifted,
-      };
+        auto_shifted: autoShifted
+      }
 
-      currentCursor = end;
+      if (end > currentCursor) currentCursor = new Date(end)
     }
 
-    const estimatedDelivery = currentCursor;
+    const estimatedDelivery = currentCursor.toISOString()
+    const feasible = currentCursor <= taskDue
 
-    /* ---------- Feasibility ---------- */
-    if (estimatedDelivery > taskDue) {
-      return NextResponse.json(
-        {
-          feasible: false,
-          reason: "Exceeds due date",
-          estimated_delivery: estimatedDelivery.toISOString(),
-          plan,
-        },
-        { headers: corsHeaders }
-      );
-    }
-
-    /* ---------- SUCCESS ---------- */
-    return NextResponse.json(
-      {
-        feasible: true,
-        estimated_delivery: estimatedDelivery.toISOString(),
-        plan,
-      },
-      { headers: corsHeaders }
-    );
-
+    return cors(
+      NextResponse.json({
+        feasible,
+        estimated_delivery: estimatedDelivery,
+        reason: feasible ? null : 'Capacity conflict',
+        plan
+      })
+    )
   } catch (err) {
-    console.error("Analyzer crash:", err);
-    return NextResponse.json(
-      { feasible: false, reason: "Analyzer internal error" },
-      { status: 500, headers: corsHeaders }
-    );
+    console.error('Analyzer crash:', err)
+    return cors(
+      NextResponse.json(
+        { feasible: false, reason: 'Analyzer crashed' },
+        { status: 500 }
+      )
+    )
   }
 }
