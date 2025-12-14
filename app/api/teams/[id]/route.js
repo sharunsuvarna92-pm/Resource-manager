@@ -7,11 +7,20 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-export async function PUT(request, { params }) {
+export async function PUT(request, context) {
   try {
-    const { id } = await params;
-    const body = await request.json();
+    const id = context.params?.id;
 
+    console.log("TEAM UPDATE ID:", id);
+
+    if (!id) {
+      return new Response(
+        JSON.stringify({ error: "Team ID missing in route" }),
+        { status: 400 }
+      );
+    }
+
+    const body = await request.json();
     const { name, description, team_leads } = body;
 
     const { data, error } = await supabase
@@ -27,10 +36,11 @@ export async function PUT(request, { params }) {
       .single();
 
     if (error) {
-      return new Response(JSON.stringify({ error: error.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" }
-      });
+      console.error("Supabase update error:", error);
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500 }
+      );
     }
 
     return new Response(JSON.stringify(data), {
@@ -39,7 +49,7 @@ export async function PUT(request, { params }) {
     });
 
   } catch (err) {
-    console.error("Update team error:", err);
+    console.error("Update team crash:", err);
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
       { status: 500 }
