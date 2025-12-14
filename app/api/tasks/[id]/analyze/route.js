@@ -1,154 +1,193 @@
-import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
-)
+);
 
-/* ---------- Helpers ---------- */
+/* ================= CONSTANTS ================= */
+const WORK_START_HOUR = 9;
+const WORK_END_HOUR = 17;
+const HOURS_PER_DAY = 8;
 
-function addDays(date, days) {
-  const d = new Date(date)
-  d.setUTCDate(d.getUTCDate() + days)
-  return d
+/* ================= HELPERS ================= */
+
+function isWeekend(date) {
+  const d = date.getDay();
+  return d === 0 || d === 6; // Sunday or Saturday
 }
 
-function ceilDays(hours, capacityPerDay = 8) {
-  return Math.max(1, Math.ceil(hours / capacityPerDay))
+function nextWorkingDay(date) {
+  const d = new Date(date);
+  while (isWeekend(d)) {
+    d.setDate(d.getDate() + 1);
+  }
+  d.setHours(WORK_START_HOUR, 0, 0, 0);
+  return d;
 }
 
-function maxDate(dates) {
-  const valid = dates.filter(Boolean).map(d => new Date(d))
-  if (!valid.length) return null
-  return new Date(Math.max(...valid.map(d => d.getTime())))
+function addWorkingHours(start, hours) {
+  let remaining = hours;
+  let current = new Date(start);
+
+  current = nextWorkingDay(current);
+
+  while (remaining > 0) {
+    if (isWeekend(current)) {
+      current = nextWorkingDay(current);
+      continue;
+    }
+
+    const endOfDay = new Date(current);
+    endOfDay.setHours(WORK_END_HOUR, 0, 0, 0);
+
+    const availableToday =
+      (endOfDay - current) / (1000 * 60 * 60);
+
+    if (remaining <= availableToday) {
+      current.setHours(current.getHours() + remaining);
+      remaining = 0;
+    } else {
+      remaining -= availableToday;
+      current.setDate(current.getDate() + 1);
+      current.setHours(WORK_START_HOUR, 0, 0, 0);
+    }
+  }
+
+  return current;
 }
 
-/* ---------- Route ---------- */
+function overlaps(aStart, aEnd, bStart, bEnd) {
+  return new Date(aStart) < new Date(bEnd) &&
+         new Date(bStart) < new Date(aEnd);
+}
 
-export async function POST(req, context) {
-  // ✅ FIX: params must be awaited
-  const { id: taskId } = await context.params
+/* ================= ROUTE ================= */
+
+export async function POST(req, { params }) {
+  const { id: taskId } = await params;
 
   if (!taskId) {
     return NextResponse.json(
-      { feasible: false, reason: 'Task ID missing' },
+      { feasible: false, reason: "Task ID missing" },
       { status: 400 }
-    )
+    );
   }
 
   /* ---------- Fetch task ---------- */
-  const { data: task, error: taskErr } = await supabase
-    .from('tasks')
-    .select('*')
-    .eq('id', taskId)
-    .single()
+  const { data: task } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("id", taskId)
+    .single();
 
-  if (taskErr || !task) {
+  if (!task) {
     return NextResponse.json(
-      { feasible: false, reason: 'Task not found' },
-      { status: 400 }
-    )
+      { feasible: false, reason: "Task not found" },
+      { status: 404 }
+    );
   }
 
-  if (!task.team_work || !task.start_date || !task.due_date) {
+  /* ---------- Fetch module ---------- */
+  const { data: module } = await supabase
+    .from("modules")
+    .select("primary_roles_map, secondary_roles_map")
+    .eq("id", task.module_id)
+    .single();
+
+  if (!module?.primary_roles_map) {
     return NextResponse.json(
-      { feasible: false, reason: 'Task missing planning data' },
+      { feasible: false, reason: "Module ownership missing" },
       { status: 400 }
-    )
+    );
   }
 
   /* ---------- Fetch committed assignments ---------- */
   const { data: assignments = [] } = await supabase
-    .from('assignments')
-    .select('*')
-    .eq('status', 'Committed')
+    .from("assignments")
+    .select("*")
+    .eq("status", "COMMITTED");
 
-  /* ---------- Fetch module ---------- */
-  const { data: module } = await supabase
-    .from('modules')
-    .select('*')
-    .eq('id', task.module_id)
-    .single()
+  const plan = {};
+  const timeline = {};
+  let feasible = true;
+  let blocking_team = null;
 
-  if (!module?.primary_roles_map) {
-    return NextResponse.json(
-      { feasible: false, reason: 'Module owners not defined' },
-      { status: 400 }
-    )
-  }
+  const teams = Object.keys(task.team_work);
 
-  /* ---------- Planning ---------- */
-  const plan = {}
-  const timeline = {}
-  let feasible = true
-  let blocking_team = null
-
-  const teams = Object.keys(task.team_work)
-
-  // Process teams in dependency-safe loop
   for (const team of teams) {
-    const config = task.team_work[team]
-    const effort = config.effort_hours
-    const dependsOn = config.depends_on || []
+    const config = task.team_work[team];
+    const effort = config.effort_hours;
+    const dependsOn = config.depends_on || [];
 
-    const primaryOwner = module.primary_roles_map[team]
-    if (!primaryOwner) {
-      feasible = false
-      blocking_team = team
-      continue
+    const candidates = [
+      module.primary_roles_map[team],
+      ...(module.secondary_roles_map?.[team] || [])
+    ].filter(Boolean);
+
+    let assigned = false;
+
+    for (const memberId of candidates) {
+      const memberAssignments = assignments.filter(
+        a => a.member_id === memberId
+      );
+
+      const dependencyEnd = dependsOn
+        .map(d => timeline[d]?.end_date)
+        .filter(Boolean)
+        .reduce(
+          (max, d) => max && max > d ? max : d,
+          null
+        );
+
+      let start = new Date(task.start_date);
+      start.setHours(WORK_START_HOUR, 0, 0, 0);
+
+      if (dependencyEnd && new Date(dependencyEnd) > start) {
+        start = new Date(dependencyEnd);
+      }
+
+      // push start if overlapping other work
+      for (const a of memberAssignments) {
+        if (overlaps(start, addWorkingHours(start, effort), a.start_date, a.end_date)) {
+          start = new Date(a.end_date);
+        }
+      }
+
+      start = nextWorkingDay(start);
+      const end = addWorkingHours(start, effort);
+
+      if (end <= new Date(task.due_date)) {
+        timeline[team] = {
+          assigned_to: memberId,
+          start_date: start.toISOString(),
+          end_date: end.toISOString(),
+          effort_hours: effort,
+          depends_on: dependsOn,
+          auto_shifted: true
+        };
+        plan[team] = timeline[team];
+        assigned = true;
+        break;
+      }
     }
 
-    /* ---- Dependency constraint ---- */
-    const dependencyEndDates = dependsOn
-      .map(dep => timeline[dep]?.end_date)
-      .filter(Boolean)
-
-    const dependencyStart = maxDate(dependencyEndDates)
-
-    /* ---- Availability constraint ---- */
-    const memberAssignments = assignments.filter(
-      a => a.member_id === primaryOwner
-    )
-
-    const busyUntil = maxDate(memberAssignments.map(a => a.end_date))
-
-    /* ---- Final start date ---- */
-    const startDate =
-      maxDate([task.start_date, dependencyStart, busyUntil]) ??
-      new Date(task.start_date)
-
-    const durationDays = ceilDays(effort)
-    const endDate = addDays(startDate, durationDays)
-
-    /* ---- Due date check ---- */
-    if (endDate > new Date(task.due_date)) {
-      feasible = false
-      blocking_team = team
+    if (!assigned) {
+      feasible = false;
+      blocking_team = team;
+      break;
     }
-
-    timeline[team] = {
-      assigned_to: primaryOwner,
-      start_date: startDate.toISOString(),
-      end_date: endDate.toISOString(),
-      effort_hours: effort,
-      depends_on: dependsOn,
-      auto_shifted: Boolean(dependencyStart || busyUntil)
-    }
-
-    plan[team] = timeline[team]
   }
 
-  const estimatedDelivery = maxDate(
-    Object.values(timeline).map(t => t.end_date)
-  )
+  const estimated_delivery = Object.values(plan)
+    .map(p => p.end_date)
+    .reduce((max, d) => max && max > d ? max : d, null);
 
   return NextResponse.json({
     feasible,
     blocking_team,
-    estimated_delivery: estimatedDelivery
-      ? estimatedDelivery.toISOString()
-      : null,
+    estimated_delivery,
     plan
-  })
+  });
 }
