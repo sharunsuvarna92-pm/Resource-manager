@@ -24,43 +24,92 @@ export async function OPTIONS() {
 }
 
 export async function POST(request, { params }) {
-  const { id: taskId } = await params;
-  const { plan, estimated_delivery } = await request.json();
+  try {
+    const { id: taskId } = await params;
+    const { plan, estimated_delivery } = await request.json();
 
-  if (!taskId || !plan) {
-    return withCors({ success: false, reason: "Invalid commit payload" }, 400);
-  }
+    if (!taskId || !plan) {
+      return withCors(
+        { success: false, reason: "Invalid commit payload" },
+        400
+      );
+    }
 
-  // 1️⃣ Update task status
-  await supabase
-    .from("tasks")
-    .update({
-      status: "COMMITTED",
-      committed_at: new Date().toISOString(),
-      estimated_delivery,
-    })
-    .eq("id", taskId);
-
-  // 2️⃣ Update existing DRAFT assignments → COMMITTED
-  for (const [team, data] of Object.entries(plan)) {
-    await supabase
-      .from("assignments")
+    /* -------------------------------------------------
+       1️⃣ Update TASK (ONLY VALID COLUMNS)
+       ------------------------------------------------- */
+    const { error: taskError } = await supabase
+      .from("tasks")
       .update({
-        member_id: data.assigned_to,
-        start_date: data.start_date,
-        end_date: data.end_date,
-        assigned_hours: data.effort_hours,
-        status: "COMMITTED",
-        auto_shifted: data.auto_shifted || false,
-        source: "analysis",
+        status: "committed",
+        expected_delivery_date: estimated_delivery,
       })
-      .eq("task_id", taskId)
-      .eq("team", team)
-      .eq("status", "draft");
-  }
+      .eq("id", taskId);
 
-  return withCors({
-    success: true,
-    message: "Task and assignments committed successfully",
-  });
+    if (taskError) {
+      console.error("Task update error:", taskError);
+      return withCors(
+        { success: false, reason: taskError.message },
+        500
+      );
+    }
+
+    /* -------------------------------------------------
+       2️⃣ Fetch DRAFT assignments for this task
+       ------------------------------------------------- */
+    const { data: draftAssignments, error: fetchError } = await supabase
+      .from("assignments")
+      .select("id, team")
+      .eq("task_id", taskId)
+      .eq("status", "draft");
+
+    if (fetchError) {
+      console.error("Draft fetch error:", fetchError);
+      return withCors(
+        { success: false, reason: fetchError.message },
+        500
+      );
+    }
+
+    /* -------------------------------------------------
+       3️⃣ Update each assignment by PRIMARY KEY
+       ------------------------------------------------- */
+    for (const assignment of draftAssignments) {
+      const planData = plan[assignment.team];
+      if (!planData) continue;
+
+      const { error } = await supabase
+        .from("assignments")
+        .update({
+          member_id: planData.assigned_to,
+          start_date: planData.start_date,
+          end_date: planData.end_date,
+          assigned_hours: planData.effort_hours,
+          status: "committed",
+          auto_shifted: planData.auto_shifted || false,
+          source: "analysis",
+        })
+        .eq("id", assignment.id);
+
+      if (error) {
+        console.error("Assignment update error:", error);
+        return withCors(
+          { success: false, reason: error.message },
+          500
+        );
+      }
+    }
+
+    return withCors({
+      success: true,
+      message: "Task and assignments committed successfully",
+    });
+
+  } catch (err) {
+    console.error("Commit crash:", err);
+    return withCors(
+      { success: false, reason: "Internal commit error" },
+      500
+    );
+  }
 }
