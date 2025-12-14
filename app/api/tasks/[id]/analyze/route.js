@@ -1,133 +1,185 @@
-import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
-)
+);
 
-/* ------------------ CORS ------------------ */
+/* ---------- CORS ---------- */
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 export async function OPTIONS() {
-  return NextResponse.json({}, {
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
-    }
-  })
+  return NextResponse.json({}, { headers: corsHeaders });
 }
 
-/* ------------------ HELPERS ------------------ */
-const addDays = (date, days) => {
-  const d = new Date(date)
-  d.setDate(d.getDate() + days)
-  return d
-}
-
-const safeDate = (value, fallback) => {
-  const d = new Date(value)
-  return isNaN(d.getTime()) ? new Date(fallback) : d
-}
-
-/* ------------------ ANALYZE ------------------ */
+/* ---------- POST /analyze ---------- */
 export async function POST(req, { params }) {
   try {
-    const taskId = params.id
+    const taskId = params?.id;
+    if (!taskId) {
+      return NextResponse.json(
+        { feasible: false, reason: "Task ID missing" },
+        { status: 400, headers: corsHeaders }
+      );
+    }
 
-    /* ---------- 1. Load task ---------- */
+    /* ---------- Fetch Task ---------- */
     const { data: task, error: taskErr } = await supabase
-      .from('tasks')
-      .select('*')
-      .eq('id', taskId)
-      .single()
+      .from("tasks")
+      .select("*")
+      .eq("id", taskId)
+      .single();
 
     if (taskErr || !task) {
       return NextResponse.json(
-        { feasible: false, reason: 'Task not found' },
-        { status: 404 }
-      )
+        { feasible: false, reason: "Task not found" },
+        { status: 404, headers: corsHeaders }
+      );
     }
 
-    /* ---------- 2. Load committed assignments ---------- */
-    const { data: committed } = await supabase
-      .from('assignments')
-      .select('*')
-      .eq('task_id', taskId)
-      .eq('status', 'Committed')
+    const {
+      start_date,
+      due_date,
+      team_work = {},
+    } = task;
 
-    /* ---------- 3. Determine baseline start ---------- */
-    let baselineStart = safeDate(task.start_date, new Date())
-
-    if (committed && committed.length > 0) {
-      const latest = committed
-        .map(a => new Date(a.end_date))
-        .filter(d => !isNaN(d.getTime()))
-        .sort((a, b) => b - a)[0]
-
-      baselineStart = latest || baselineStart
+    if (!start_date || !due_date) {
+      return NextResponse.json(
+        { feasible: false, reason: "Task dates missing" },
+        { status: 400, headers: corsHeaders }
+      );
     }
 
-    /* ---------- 4. Build execution plan ---------- */
-    const plan = {}
-    let currentPointer = new Date(baselineStart)
+    const taskStart = new Date(start_date);
+    const taskDue = new Date(due_date);
 
-    const teamWork = task.team_work || {}
+    /* ---------- Fetch committed assignments ONLY ---------- */
+    const { data: committedAssignments } = await supabase
+      .from("assignments")
+      .select("*")
+      .eq("task_id", taskId)
+      .eq("status", "Committed");
 
-    for (const team of Object.keys(teamWork)) {
-      const effort = teamWork[team].effort_hours || 0
-      const dependsOn = teamWork[team].depends_on || []
+    /* ---------- Build busy map ---------- */
+    const busyMap = {};
 
-      // dependency resolution
+    (committedAssignments || []).forEach(a => {
+      if (!a.member_id || !a.start_date || !a.end_date) return;
+
+      if (!busyMap[a.member_id]) busyMap[a.member_id] = [];
+      busyMap[a.member_id].push({
+        start: new Date(a.start_date),
+        end: new Date(a.end_date),
+      });
+    });
+
+    /* ---------- Helpers ---------- */
+    const addDays = (d, days) => {
+      const x = new Date(d);
+      x.setDate(x.getDate() + days);
+      return x;
+    };
+
+    const overlaps = (s1, e1, s2, e2) =>
+      s1 < e2 && s2 < e1;
+
+    const nextFreeDate = (memberId, desiredStart) => {
+      const blocks = busyMap[memberId] || [];
+      let cursor = new Date(desiredStart);
+
+      while (true) {
+        const clash = blocks.find(b =>
+          overlaps(cursor, addDays(cursor, 1), b.start, b.end)
+        );
+        if (!clash) return cursor;
+        cursor = addDays(clash.end, 1);
+      }
+    };
+
+    /* ---------- Analysis Engine ---------- */
+    const plan = {};
+    let currentCursor = new Date(taskStart);
+    let autoShifted = false;
+
+    for (const [team, info] of Object.entries(team_work)) {
+      const effortDays = Math.ceil((info.effort_hours || 1) / 8);
+      const dependsOn = info.depends_on || [];
+
+      /* dependency handling */
       if (dependsOn.length > 0) {
         const depEndDates = dependsOn
-          .map(t => plan[t]?.end_date)
+          .map(d => plan[d]?.end_date)
           .filter(Boolean)
-          .map(d => new Date(d))
+          .map(d => new Date(d));
 
         if (depEndDates.length > 0) {
-          currentPointer = new Date(
-            Math.max(...depEndDates.map(d => d.getTime()))
-          )
+          const maxDepEnd = new Date(Math.max(...depEndDates));
+          if (maxDepEnd > currentCursor) {
+            currentCursor = addDays(maxDepEnd, 1);
+          }
         }
       }
 
-      const start = new Date(currentPointer)
-      const end = addDays(start, Math.ceil(effort / 8))
+      const memberId = info.assigned_to;
+      let start = currentCursor;
+
+      if (memberId && busyMap[memberId]) {
+        const free = nextFreeDate(memberId, start);
+        if (free > start) {
+          start = free;
+          autoShifted = true;
+        }
+      }
+
+      const end = addDays(start, effortDays);
 
       plan[team] = {
-        assigned_to: teamWork[team].assigned_to || null,
-        effort_hours: effort,
+        assigned_to: memberId,
         start_date: start.toISOString(),
         end_date: end.toISOString(),
+        effort_hours: info.effort_hours,
         depends_on: dependsOn,
-        auto_shifted: true
-      }
+        auto_shifted: autoShifted,
+      };
 
-      currentPointer = new Date(end)
+      currentCursor = end;
     }
 
-    /* ---------- 5. Delivery decision ---------- */
-    const estimatedDelivery = currentPointer
-    const dueDate = safeDate(task.due_date, estimatedDelivery)
+    const estimatedDelivery = currentCursor;
 
-    const feasible = estimatedDelivery <= dueDate
+    /* ---------- Feasibility ---------- */
+    if (estimatedDelivery > taskDue) {
+      return NextResponse.json(
+        {
+          feasible: false,
+          reason: "Exceeds due date",
+          estimated_delivery: estimatedDelivery.toISOString(),
+          plan,
+        },
+        { headers: corsHeaders }
+      );
+    }
 
-    return NextResponse.json({
-      feasible,
-      estimated_delivery: estimatedDelivery.toISOString(),
-      reason: feasible ? null : 'Capacity overlap or dependency delay',
-      plan
-    }, {
-      headers: {
-        'Access-Control-Allow-Origin': '*'
-      }
-    })
+    /* ---------- SUCCESS ---------- */
+    return NextResponse.json(
+      {
+        feasible: true,
+        estimated_delivery: estimatedDelivery.toISOString(),
+        plan,
+      },
+      { headers: corsHeaders }
+    );
 
   } catch (err) {
-    console.error('Analyzer crash:', err)
+    console.error("Analyzer crash:", err);
     return NextResponse.json(
-      { feasible: false, reason: 'Analyzer internal error' },
-      { status: 500 }
-    )
+      { feasible: false, reason: "Analyzer internal error" },
+      { status: 500, headers: corsHeaders }
+    );
   }
 }
