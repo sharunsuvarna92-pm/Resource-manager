@@ -8,69 +8,81 @@ const supabase = createClient(
 
 /* ================= CONFIG ================= */
 
-const WORK_START_HOUR = 9;   // 9 AM
-const WORK_END_HOUR = 17;    // 5 PM
-const HOURS_PER_DAY = 8;
+const IST_OFFSET_MINUTES = 330; // UTC +5:30
+const WORK_START_HOUR = 9;      // 9 AM IST
+const WORK_END_HOUR = 17;       // 5 PM IST
 
-/* ================= HELPERS ================= */
+/* ================= TIME HELPERS (IST) ================= */
 
-function isWeekend(date) {
-  const d = date.getDay();
-  return d === 0 || d === 6; // Sunday or Saturday
+function toIST(date) {
+  const d = new Date(date);
+  return new Date(d.getTime() + IST_OFFSET_MINUTES * 60 * 1000);
 }
 
-function nextWorkingDay(date) {
+function fromIST(date) {
   const d = new Date(date);
+  return new Date(d.getTime() - IST_OFFSET_MINUTES * 60 * 1000);
+}
+
+function isWeekendIST(date) {
+  const d = toIST(date);
+  const day = d.getDay();
+  return day === 0 || day === 6;
+}
+
+function nextWorkingDayIST(date) {
+  let d = toIST(date);
+
   do {
     d.setDate(d.getDate() + 1);
-  } while (isWeekend(d));
+  } while (isWeekendIST(fromIST(d)));
+
   d.setHours(WORK_START_HOUR, 0, 0, 0);
-  return d;
+  return fromIST(d);
 }
 
-function normalizeToWorkingStart(date) {
-  const d = new Date(date);
+function normalizeToWorkingStartIST(date) {
+  let d = toIST(date);
 
-  // Weekend → next working day
-  if (isWeekend(d)) {
-    return nextWorkingDay(d);
+  if (isWeekendIST(date)) {
+    return nextWorkingDayIST(date);
   }
 
-  // After work hours → next working day
   if (d.getHours() >= WORK_END_HOUR) {
-    return nextWorkingDay(d);
+    return nextWorkingDayIST(date);
   }
 
-  // Before work hours → same day 9 AM
   if (d.getHours() < WORK_START_HOUR) {
     d.setHours(WORK_START_HOUR, 0, 0, 0);
   }
 
-  return d;
+  return fromIST(d);
 }
 
-function addWorkingHours(start, hours) {
+function addWorkingHoursIST(start, hours) {
   let remaining = hours;
-  let current = normalizeToWorkingStart(start);
+  let current = normalizeToWorkingStartIST(start);
 
   while (remaining > 0) {
-    if (isWeekend(current)) {
-      current = nextWorkingDay(current);
+    if (isWeekendIST(current)) {
+      current = nextWorkingDayIST(current);
       continue;
     }
 
-    const endOfDay = new Date(current);
+    const istCurrent = toIST(current);
+    const endOfDay = new Date(istCurrent);
     endOfDay.setHours(WORK_END_HOUR, 0, 0, 0);
 
     const availableToday =
-      (endOfDay.getTime() - current.getTime()) / (1000 * 60 * 60);
+      (endOfDay.getTime() - istCurrent.getTime()) / (1000 * 60 * 60);
 
     if (remaining <= availableToday) {
-      current.setHours(current.getHours() + remaining);
+      istCurrent.setHours(istCurrent.getHours() + remaining);
       remaining = 0;
+      current = fromIST(istCurrent);
     } else {
       remaining -= availableToday;
-      current = nextWorkingDay(current);
+      current = nextWorkingDayIST(current);
     }
   }
 
@@ -80,6 +92,31 @@ function addWorkingHours(start, hours) {
 function overlaps(aStart, aEnd, bStart, bEnd) {
   return new Date(aStart) < new Date(bEnd) &&
          new Date(bStart) < new Date(aEnd);
+}
+
+/* -------- Dependency-aware team ordering -------- */
+
+function sortTeamsByDependencies(teamWork) {
+  const visited = new Set();
+  const result = [];
+
+  function visit(team) {
+    if (visited.has(team)) return;
+    visited.add(team);
+
+    const deps = teamWork[team]?.depends_on || [];
+    for (const dep of deps) {
+      visit(dep);
+    }
+
+    result.push(team);
+  }
+
+  for (const team of Object.keys(teamWork)) {
+    visit(team);
+  }
+
+  return result;
 }
 
 /* ================= ROUTE ================= */
@@ -133,7 +170,7 @@ export async function POST(req, { params }) {
   let feasible = true;
   let blocking_team = null;
 
-  const teams = Object.keys(task.team_work);
+  const teams = sortTeamsByDependencies(task.team_work);
 
   for (const team of teams) {
     const config = task.team_work[team];
@@ -152,9 +189,8 @@ export async function POST(req, { params }) {
         a => a.member_id === memberId
       );
 
-      /* ---- Dependency constraint ---- */
       const dependencyEnd = dependsOn
-        .map(d => timeline[d]?.end_date)
+        .map(dep => timeline[dep]?.end_date)
         .filter(Boolean)
         .reduce(
           (max, d) => max && max > d ? max : d,
@@ -167,25 +203,23 @@ export async function POST(req, { params }) {
         start = new Date(dependencyEnd);
       }
 
-      start = normalizeToWorkingStart(start);
+      start = normalizeToWorkingStartIST(start);
 
-      /* ---- Availability constraint ---- */
       for (const a of memberAssignments) {
         if (
           overlaps(
             start,
-            addWorkingHours(start, effort),
+            addWorkingHoursIST(start, effort),
             a.start_date,
             a.end_date
           )
         ) {
-          start = normalizeToWorkingStart(a.end_date);
+          start = normalizeToWorkingStartIST(a.end_date);
         }
       }
 
-      const end = addWorkingHours(start, effort);
+      const end = addWorkingHoursIST(start, effort);
 
-      /* ---- Due date check ---- */
       if (end <= new Date(task.due_date)) {
         timeline[team] = {
           assigned_to: memberId,
@@ -193,9 +227,7 @@ export async function POST(req, { params }) {
           end_date: end.toISOString(),
           effort_hours: effort,
           depends_on: dependsOn,
-          auto_shifted:
-            start.getTime() !==
-            new Date(task.start_date).getTime()
+          auto_shifted: true
         };
         plan[team] = timeline[team];
         assigned = true;
