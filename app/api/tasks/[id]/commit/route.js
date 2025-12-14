@@ -34,7 +34,7 @@ export async function OPTIONS() {
 // ------------------
 export async function POST(request, { params }) {
   try {
-    // ✅ App Router params are async
+    // App Router params are async
     const { id: taskId } = await params;
 
     if (!taskId) {
@@ -44,17 +44,84 @@ export async function POST(request, { params }) {
       );
     }
 
-    const body = await request.json();
-    const { plan, estimated_delivery } = body;
-
-    if (!plan || Object.keys(plan).length === 0) {
+    // ------------------
+    // Parse & validate body FIRST
+    // ------------------
+    let body;
+    try {
+      body = await request.json();
+    } catch {
       return withCors(
-        { success: false, reason: "Analysis plan missing" },
+        {
+          success: false,
+          reason:
+            "Commit payload missing. Expected { estimated_delivery, plan }",
+        },
         400
       );
     }
 
-    // 1️⃣ Verify task exists
+    const { plan, estimated_delivery } = body;
+
+    if (!plan || typeof plan !== "object" || Object.keys(plan).length === 0) {
+      return withCors(
+        {
+          success: false,
+          reason: "Invalid or empty plan. Commit requires a valid analysis plan.",
+        },
+        400
+      );
+    }
+
+    // ------------------
+    // Build assignments IN MEMORY (NO DB WRITE YET)
+    // ------------------
+    const assignmentRows = [];
+
+    for (const [team, data] of Object.entries(plan)) {
+      if (
+        !data?.assigned_to ||
+        !data?.start_date ||
+        !data?.end_date ||
+        !data?.effort_hours
+      ) {
+        return withCors(
+          {
+            success: false,
+            reason: `Invalid plan entry for team ${team}`,
+            received: data,
+          },
+          400
+        );
+      }
+
+      assignmentRows.push({
+        task_id: taskId,
+        team,
+        member_id: data.assigned_to,
+        start_date: data.start_date,     // ✅ from analysis
+        end_date: data.end_date,         // ✅ from analysis
+        assigned_hours: data.effort_hours,
+        status: "committed",
+        source: "analysis",
+        auto_shifted: data.auto_shifted || false,
+        created_at: new Date().toISOString(),
+      });
+    }
+
+    if (assignmentRows.length === 0) {
+      return withCors(
+        {
+          success: false,
+          reason: "No valid assignments generated from plan. Commit aborted.",
+        },
+        400
+      );
+    }
+
+    // ------------------
+    // Verify task exists
+    // ------------------
     const { data: task } = await supabase
       .from("tasks")
       .select("id")
@@ -68,39 +135,28 @@ export async function POST(request, { params }) {
       );
     }
 
-    // 2️⃣ Update task (authoritative commit)
+    // ------------------
+    // NOW it is SAFE to modify DB
+    // ------------------
+
+    // 1️⃣ Update task
     await supabase
       .from("tasks")
       .update({
         status: "committed",
         committed_at: new Date().toISOString(),
-        estimated_delivery
+        estimated_delivery,
       })
       .eq("id", taskId);
 
-    // 3️⃣ Remove all non-committed assignments for this task
+    // 2️⃣ Remove old draft assignments ONLY
     await supabase
       .from("assignments")
       .delete()
       .eq("task_id", taskId)
       .neq("status", "committed");
 
-    // 4️⃣ Insert committed assignments from analyzer plan
-    const assignmentRows = Object.entries(plan).map(
-      ([team, data]) => ({
-        task_id: taskId,
-        team,
-        member_id: data.assigned_to,
-        start_date: data.start_date,      // ✅ FROM ANALYSIS
-        end_date: data.end_date,          // ✅ FROM ANALYSIS
-        assigned_hours: data.effort_hours,
-        status: "committed",
-        source: "analysis",
-        auto_shifted: data.auto_shifted || false,
-        created_at: new Date().toISOString()
-      })
-    );
-
+    // 3️⃣ Insert committed assignments
     await supabase
       .from("assignments")
       .insert(assignmentRows);
@@ -108,7 +164,7 @@ export async function POST(request, { params }) {
     return withCors({
       success: true,
       message: "Task and assignments committed successfully",
-      assignments_created: assignmentRows.length
+      assignments_created: assignmentRows.length,
     });
 
   } catch (err) {
