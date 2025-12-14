@@ -15,18 +15,20 @@ function addDays(date, days) {
 }
 
 function ceilDays(hours, capacityPerDay = 8) {
-  return Math.ceil(hours / capacityPerDay)
+  return Math.max(1, Math.ceil(hours / capacityPerDay))
 }
 
 function maxDate(dates) {
-  if (!dates.length) return null
-  return new Date(Math.max(...dates.map(d => new Date(d).getTime())))
+  const valid = dates.filter(Boolean).map(d => new Date(d))
+  if (!valid.length) return null
+  return new Date(Math.max(...valid.map(d => d.getTime())))
 }
 
 /* ---------- Route ---------- */
 
-export async function POST(req, { params }) {
-  const { id: taskId } = params
+export async function POST(req, context) {
+  // ✅ FIX: params must be awaited
+  const { id: taskId } = await context.params
 
   if (!taskId) {
     return NextResponse.json(
@@ -36,13 +38,13 @@ export async function POST(req, { params }) {
   }
 
   /* ---------- Fetch task ---------- */
-  const { data: task } = await supabase
+  const { data: task, error: taskErr } = await supabase
     .from('tasks')
     .select('*')
     .eq('id', taskId)
     .single()
 
-  if (!task) {
+  if (taskErr || !task) {
     return NextResponse.json(
       { feasible: false, reason: 'Task not found' },
       { status: 400 }
@@ -69,21 +71,32 @@ export async function POST(req, { params }) {
     .eq('id', task.module_id)
     .single()
 
+  if (!module?.primary_roles_map) {
+    return NextResponse.json(
+      { feasible: false, reason: 'Module owners not defined' },
+      { status: 400 }
+    )
+  }
+
   /* ---------- Planning ---------- */
   const plan = {}
   const timeline = {}
   let feasible = true
   let blocking_team = null
 
-  for (const [team, config] of Object.entries(task.team_work)) {
+  const teams = Object.keys(task.team_work)
+
+  // Process teams in dependency-safe loop
+  for (const team of teams) {
+    const config = task.team_work[team]
     const effort = config.effort_hours
     const dependsOn = config.depends_on || []
 
-    const primaryOwner = module?.primary_roles_map?.[team]
+    const primaryOwner = module.primary_roles_map[team]
     if (!primaryOwner) {
       feasible = false
       blocking_team = team
-      break
+      continue
     }
 
     /* ---- Dependency constraint ---- */
@@ -101,11 +114,9 @@ export async function POST(req, { params }) {
     const busyUntil = maxDate(memberAssignments.map(a => a.end_date))
 
     /* ---- Final start date ---- */
-    const startDate = maxDate([
-      task.start_date,
-      dependencyStart,
-      busyUntil
-    ]) || new Date(task.start_date)
+    const startDate =
+      maxDate([task.start_date, dependencyStart, busyUntil]) ??
+      new Date(task.start_date)
 
     const durationDays = ceilDays(effort)
     const endDate = addDays(startDate, durationDays)
