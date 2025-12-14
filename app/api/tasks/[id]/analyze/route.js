@@ -163,7 +163,7 @@ export async function POST(req, { params }) {
   const { data: assignments = [] } = await supabase
     .from("assignments")
     .select("*")
-    .eq("status", "COMMITTED");
+    .eq("status", "committed");
 
   const plan = {};
   const timeline = {};
