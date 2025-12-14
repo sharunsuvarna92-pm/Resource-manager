@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(
@@ -7,133 +6,132 @@ const supabase = createClient(
 )
 
 /* ---------------- CORS ---------------- */
-function cors(res) {
-  res.headers.set('Access-Control-Allow-Origin', '*')
-  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-  res.headers.set('Access-Control-Allow-Headers', 'Content-Type')
-  return res
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type'
 }
 
 export async function OPTIONS() {
-  return cors(new NextResponse(null, { status: 204 }))
+  return new Response(null, { status: 204, headers: corsHeaders })
 }
 
-/* ---------------- ANALYZE ---------------- */
+/* ---------------- HELPERS ---------------- */
+function addDays(date, days) {
+  const d = new Date(date)
+  d.setDate(d.getDate() + days)
+  return d
+}
+
+/* ---------------- POST ---------------- */
 export async function POST(req, { params }) {
   try {
-    const { id: taskId } = params
+    const { id: taskId } = await params
 
     if (!taskId) {
-      return cors(
-        NextResponse.json(
-          { feasible: false, reason: 'Task ID missing' },
-          { status: 400 }
-        )
+      return Response.json(
+        { error: 'Task ID missing' },
+        { status: 400, headers: corsHeaders }
       )
     }
 
-    /* -------- Fetch task -------- */
-    const { data: task, error: taskErr } = await supabase
+    /* ---------- Fetch task ---------- */
+    const { data: task, error: taskError } = await supabase
       .from('tasks')
       .select('*')
       .eq('id', taskId)
       .single()
 
-    if (taskErr || !task) {
-      return cors(
-        NextResponse.json(
-          { feasible: false, reason: 'Task not found' },
-          { status: 404 }
-        )
+    if (taskError || !task) {
+      return Response.json(
+        { feasible: false, reason: 'Task not found' },
+        { status: 404, headers: corsHeaders }
       )
     }
 
-    const taskStart = new Date(task.start_date)
-    const taskDue = new Date(task.due_date)
+    const teamWork = task.team_work || {}
 
-    /* -------- Fetch ONLY committed assignments -------- */
+    /* ---------- Fetch committed assignments ---------- */
     const { data: committedAssignments } = await supabase
       .from('assignments')
       .select('*')
       .eq('status', 'Committed')
 
-    /* -------- Team work is source of truth -------- */
-    const teamWork = task.team_work || {}
-
-    const plan = {}
-    let currentCursor = new Date(taskStart)
-
-    for (const [teamName, work] of Object.entries(teamWork)) {
-      const effortHours = work.effort_hours || 0
-      const dependsOn = work.depends_on || []
-
-      /* ----- Resolve dependency end ----- */
-      let dependencyEnd = null
-      for (const dep of dependsOn) {
-        if (plan[dep]?.end_date) {
-          const depEnd = new Date(plan[dep].end_date)
-          if (!dependencyEnd || depEnd > dependencyEnd) {
-            dependencyEnd = depEnd
-          }
-        }
-      }
-
-      let start = dependencyEnd
-        ? new Date(dependencyEnd)
-        : new Date(currentCursor)
-
-      /* ----- Check committed conflicts ----- */
-      const teamAssignments = committedAssignments.filter(
-        a => a.team === teamName
-      )
-
-      let autoShifted = false
-      for (const a of teamAssignments) {
-        if (!a.start_date || !a.end_date) continue
-
-        const aStart = new Date(a.start_date)
-        const aEnd = new Date(a.end_date)
-
-        if (start >= aStart && start <= aEnd) {
-          start = new Date(aEnd)
-          autoShifted = true
-        }
-      }
-
-      const daysNeeded = Math.max(1, Math.ceil(effortHours / 8))
-      const end = new Date(start)
-      end.setDate(end.getDate() + daysNeeded)
-
-      plan[teamName] = {
-        assigned_to: work.assigned_to || null,
-        start_date: start.toISOString(),
-        end_date: end.toISOString(),
-        effort_hours: effortHours,
-        depends_on: dependsOn,
-        auto_shifted: autoShifted
-      }
-
-      if (end > currentCursor) currentCursor = new Date(end)
+    // Group committed assignments by member
+    const busyMap = {}
+    for (const a of committedAssignments || []) {
+      if (!busyMap[a.member_id]) busyMap[a.member_id] = []
+      busyMap[a.member_id].push(a)
     }
 
-    const estimatedDelivery = currentCursor.toISOString()
-    const feasible = currentCursor <= taskDue
+    const plan = {}
+    let estimatedDelivery = new Date(task.start_date)
 
-    return cors(
-      NextResponse.json({
+    /* ---------- Analyze each team ---------- */
+    for (const [teamName, work] of Object.entries(teamWork)) {
+      const {
+        assigned_to,
+        effort_hours,
+        depends_on = []
+      } = work
+
+      let start = new Date(task.start_date)
+
+      /* ----- Respect dependencies ----- */
+      for (const dep of depends_on) {
+        if (plan[dep]) {
+          const depEnd = new Date(plan[dep].end_date)
+          if (depEnd > start) start = depEnd
+        }
+      }
+
+      /* ----- Respect member busy schedule ----- */
+      const memberBusy = busyMap[assigned_to] || []
+      for (const b of memberBusy) {
+        const busyEnd = new Date(b.end_date)
+        if (busyEnd > start) start = busyEnd
+      }
+
+      const durationDays = Math.ceil(effort_hours / 8)
+      const end = addDays(start, durationDays)
+
+      plan[teamName] = {
+        assigned_to,
+        start_date: start.toISOString(),
+        end_date: end.toISOString(),
+        effort_hours,
+        depends_on,
+        auto_shifted: start > new Date(task.start_date)
+      }
+
+      if (end > estimatedDelivery) estimatedDelivery = end
+    }
+
+    /* ---------- Feasibility ---------- */
+    const dueDate = new Date(task.due_date)
+    const feasible = estimatedDelivery <= dueDate
+
+    return Response.json(
+      {
         feasible,
-        estimated_delivery: estimatedDelivery,
-        reason: feasible ? null : 'Capacity conflict',
-        plan
-      })
+        estimated_delivery: estimatedDelivery.toISOString(),
+        plan,
+        ...(feasible
+          ? {}
+          : {
+              reason: 'Estimated delivery exceeds due date',
+              blocking_teams: Object.keys(plan).filter(
+                t => new Date(plan[t].end_date) > dueDate
+              )
+            })
+      },
+      { status: 200, headers: corsHeaders }
     )
   } catch (err) {
-    console.error('Analyzer crash:', err)
-    return cors(
-      NextResponse.json(
-        { feasible: false, reason: 'Analyzer crashed' },
-        { status: 500 }
-      )
+    console.error('Analyze crash:', err)
+    return Response.json(
+      { feasible: false, reason: 'Internal analysis error' },
+      { status: 500, headers: corsHeaders }
     )
   }
 }
