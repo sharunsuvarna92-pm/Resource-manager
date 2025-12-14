@@ -11,16 +11,24 @@ const supabase = createClient(
 );
 
 // ------------------
-// CREATE TASK (PLANNING)
+// EDIT TASK (PLANNING ONLY)
 // ------------------
-export async function POST(request) {
+export async function PUT(request, { params }) {
   try {
-    const body = await request.json();
+    // ✅ App Router params are async
+    const { id: taskId } = await params;
 
+    if (!taskId) {
+      return new Response(
+        JSON.stringify({ error: "Task ID missing in route" }),
+        { status: 400 }
+      );
+    }
+
+    const body = await request.json();
     const {
       title,
       description,
-      module_id,
       start_date,
       due_date,
       teams_involved,
@@ -28,19 +36,29 @@ export async function POST(request) {
     } = body;
 
     // ------------------
-    // Validation
+    // Fetch task
     // ------------------
-    if (
-      !title ||
-      !module_id ||
-      !start_date ||
-      !due_date ||
-      !Array.isArray(teams_involved) ||
-      teams_involved.length === 0 ||
-      !team_work
-    ) {
+    const { data: task, error: taskFetchError } = await supabase
+      .from("tasks")
+      .select("*")
+      .eq("id", taskId)
+      .single();
+
+    if (taskFetchError || !task) {
       return new Response(
-        JSON.stringify({ error: "Missing required task fields" }),
+        JSON.stringify({ error: "Task not found" }),
+        { status: 404 }
+      );
+    }
+
+    // ------------------
+    // Enforce PLANNING only
+    // ------------------
+    if (task.status !== "PLANNING") {
+      return new Response(
+        JSON.stringify({
+          error: "Only tasks in PLANNING status can be edited"
+        }),
         { status: 400 }
       );
     }
@@ -51,44 +69,50 @@ export async function POST(request) {
     const { data: module, error: moduleError } = await supabase
       .from("modules")
       .select("primary_roles_map")
-      .eq("id", module_id)
+      .eq("id", task.module_id)
       .single();
 
     if (moduleError || !module) {
       return new Response(
-        JSON.stringify({ error: "Invalid module_id" }),
+        JSON.stringify({ error: "Invalid module configuration" }),
         { status: 400 }
       );
     }
 
     // ------------------
-    // Create task
+    // Update task
     // ------------------
-    const { data: task, error: taskError } = await supabase
+    const { error: taskUpdateError } = await supabase
       .from("tasks")
-      .insert({
+      .update({
         title,
         description,
-        module_id,
         start_date,
         due_date,
         teams_involved,
-        team_work,
-        status: "PLANNING"
+        team_work
       })
-      .select()
-      .single();
+      .eq("id", taskId);
 
-    if (taskError) {
-      console.error("Task create error:", taskError);
+    if (taskUpdateError) {
+      console.error("Task update error:", taskUpdateError);
       return new Response(
-        JSON.stringify({ error: taskError.message }),
+        JSON.stringify({ error: taskUpdateError.message }),
         { status: 500 }
       );
     }
 
     // ------------------
-    // Create draft assignments
+    // Delete existing DRAFT assignments
+    // ------------------
+    await supabase
+      .from("assignments")
+      .delete()
+      .eq("task_id", taskId)
+      .eq("status", "draft");
+
+    // ------------------
+    // Recreate draft assignments
     // ------------------
     const assignments = [];
 
@@ -98,14 +122,14 @@ export async function POST(request) {
       if (!primaryOwner) {
         return new Response(
           JSON.stringify({
-            error: `Primary owner not defined for team ${team} in module`
+            error: `Primary owner not defined for team ${team}`
           }),
           { status: 400 }
         );
       }
 
       assignments.push({
-        task_id: task.id,
+        task_id: taskId,
         team,
         member_id: primaryOwner,
         start_date,
@@ -122,7 +146,7 @@ export async function POST(request) {
       .insert(assignments);
 
     if (assignmentError) {
-      console.error("Assignment create error:", assignmentError);
+      console.error("Draft assignment recreate error:", assignmentError);
       return new Response(
         JSON.stringify({ error: assignmentError.message }),
         { status: 500 }
@@ -130,19 +154,12 @@ export async function POST(request) {
     }
 
     return new Response(
-      JSON.stringify({
-        success: true,
-        task_id: task.id,
-        status: task.status
-      }),
-      {
-        status: 201,
-        headers: { "Content-Type": "application/json" }
-      }
+      JSON.stringify({ success: true }),
+      { status: 200 }
     );
 
   } catch (err) {
-    console.error("Create task crash:", err);
+    console.error("Edit task crash:", err);
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
       { status: 500 }

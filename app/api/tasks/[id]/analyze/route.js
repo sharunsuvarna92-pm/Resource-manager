@@ -2,94 +2,22 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// ------------------
-// Supabase client
-// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // ------------------
-// CORS helper
+// Helpers
 // ------------------
-function withCors(body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    },
-  });
+function addHours(date, hours) {
+  const d = new Date(date);
+  d.setHours(d.getHours() + hours);
+  return d;
 }
 
-export async function OPTIONS() {
-  return withCors({});
-}
-
-// ------------------
-// DAG dependency resolver
-// ------------------
-function resolveExecutionOrder(teamWork) {
-  const visited = new Set();
-  const order = [];
-
-  function visit(team) {
-    if (visited.has(team)) return;
-    visited.add(team);
-
-    const deps = teamWork[team]?.depends_on || [];
-    deps.forEach(dep => {
-      if (teamWork[dep]) visit(dep);
-    });
-
-    order.push(team);
-  }
-
-  Object.keys(teamWork).forEach(visit);
-  return order;
-}
-
-// ------------------
-// Scheduling helpers
-// ------------------
-function calculateEndDate(startDate, effortHours) {
-  const days = Math.max(1, Math.ceil(effortHours / 8));
-  const end = new Date(startDate);
-  end.setDate(end.getDate() + days);
-  return end;
-}
-
-function findNextAvailableStart(assignments, memberId, proposedStart) {
-  const conflicts = assignments
-    .filter(a =>
-      a.member_id === memberId &&
-      a.status === "committed" &&
-      new Date(a.end_date) >= proposedStart
-    )
-    .sort((a, b) => new Date(a.end_date) - new Date(b.end_date));
-
-  if (conflicts.length === 0) return proposedStart;
-
-  const last = conflicts[conflicts.length - 1];
-  const next = new Date(last.end_date);
-  next.setDate(next.getDate() + 1);
-  return next;
-}
-
-function getEarliestStart(team, teamWork, plan, taskStart) {
-  const deps = teamWork[team]?.depends_on || [];
-  const validDeps = deps.filter(d => plan[d]);
-
-  if (validDeps.length === 0) {
-    return new Date(taskStart);
-  }
-
-  return new Date(
-    Math.max(...validDeps.map(d => new Date(plan[d].end_date).getTime()))
-  );
+function maxDate(dates) {
+  return new Date(Math.max(...dates.map(d => new Date(d).getTime())));
 }
 
 // ------------------
@@ -97,17 +25,8 @@ function getEarliestStart(team, teamWork, plan, taskStart) {
 // ------------------
 export async function POST(request, { params }) {
   try {
-    // Next.js App Router params are async
     const { id: taskId } = await params;
 
-    if (!taskId) {
-      return withCors(
-        { feasible: false, reason: "Task ID missing" },
-        400
-      );
-    }
-
-    // 1️⃣ Fetch task
     const { data: task } = await supabase
       .from("tasks")
       .select("*")
@@ -115,113 +34,105 @@ export async function POST(request, { params }) {
       .single();
 
     if (!task) {
-      return withCors(
-        { feasible: false, reason: "Task not found" },
-        404
+      return new Response(
+        JSON.stringify({ error: "Task not found" }),
+        { status: 404 }
       );
     }
 
-    // 2️⃣ Fetch module ownership
-    const { data: moduleData } = await supabase
+    const { data: module } = await supabase
       .from("modules")
       .select("primary_roles_map, secondary_roles_map")
       .eq("id", task.module_id)
       .single();
 
-    if (!moduleData) {
-      return withCors(
-        { feasible: false, reason: "Module not found" },
-        404
-      );
-    }
-
-    // 3️⃣ Fetch committed assignments only
-    const { data: assignments = [] } = await supabase
+    const { data: committedAssignments } = await supabase
       .from("assignments")
       .select("*")
-      .eq("status", "committed");
+      .eq("status", "committed")
+      .neq("task_id", taskId);
 
-    const teamWork = task.team_work || {};
-    const executionOrder = resolveExecutionOrder(teamWork);
     const plan = {};
+    const conflicts = [];
+    const timelineEnd = {};
 
-    // 4️⃣ Schedule teams (auto-shift enabled)
-    for (const team of executionOrder) {
-      const work = teamWork[team];
+    for (const [team, work] of Object.entries(task.team_work)) {
+      const { effort_hours, depends_on = [] } = work;
 
-      const baseStart = getEarliestStart(
-        team,
-        teamWork,
-        plan,
-        task.start_date
-      );
+      let start = depends_on.length
+        ? maxDate(depends_on.map(d => timelineEnd[d]).filter(Boolean))
+        : new Date(task.start_date);
 
-      const primary = moduleData.primary_roles_map?.[team];
-      const secondary = moduleData.secondary_roles_map?.[team] || [];
-      const candidates = [primary, ...secondary].filter(Boolean);
+      let assignedTo = module.primary_roles_map?.[team];
+      let autoShifted = false;
 
-      let assigned = null;
-      let startDate = null;
-      let endDate = null;
-      let shifted = false;
+      const isAvailable = (memberId) => {
+        return committedAssignments
+          .filter(a => a.member_id === memberId)
+          .every(a =>
+            new Date(a.end_date) <= start ||
+            new Date(a.start_date) >= addHours(start, effort_hours)
+          );
+      };
 
-      for (const memberId of candidates) {
-        let candidateStart = baseStart;
+      if (!isAvailable(assignedTo)) {
+        const secondaries = module.secondary_roles_map?.[team] || [];
+        const availableSecondary = secondaries.find(isAvailable);
 
-        candidateStart = findNextAvailableStart(
-          assignments,
-          memberId,
-          candidateStart
-        );
+        if (availableSecondary) {
+          assignedTo = availableSecondary;
+          autoShifted = true;
+        } else {
+          const busyAssignments = committedAssignments.filter(
+            a => a.member_id === assignedTo
+          );
 
-        const candidateEnd = calculateEndDate(
-          candidateStart,
-          work.effort_hours
-        );
+          const latestEnd = maxDate(busyAssignments.map(a => a.end_date));
+          conflicts.push({
+            team,
+            member_id: assignedTo,
+            overlap_start: task.start_date,
+            overlap_end: latestEnd.toISOString()
+          });
 
-        if (candidateEnd <= new Date(task.required_by)) {
-          assigned = memberId;
-          startDate = candidateStart;
-          endDate = candidateEnd;
-          shifted = candidateStart.getTime() !== baseStart.getTime();
-          break;
+          start = latestEnd;
+          autoShifted = true;
         }
       }
 
-      if (!assigned) {
-        return withCors({
-          feasible: false,
-          reason: `${team} team cannot complete work before due date`,
-          blocking_team: team
-        });
-      }
+      const end = addHours(start, effort_hours);
 
       plan[team] = {
-        assigned_to: assigned,
-        start_date: startDate.toISOString(),
-        end_date: endDate.toISOString(),
-        effort_hours: work.effort_hours,
-        depends_on: work.depends_on || [],
-        auto_shifted: shifted
+        assigned_to: assignedTo,
+        start_date: start.toISOString(),
+        end_date: end.toISOString(),
+        effort_hours,
+        depends_on,
+        auto_shifted: autoShifted
       };
+
+      timelineEnd[team] = end;
     }
 
-    // 5️⃣ Final delivery date
-    const estimatedDelivery = new Date(
-      Math.max(...Object.values(plan).map(p => new Date(p.end_date).getTime()))
+    const estimatedDelivery = maxDate(Object.values(timelineEnd));
+    const feasible = estimatedDelivery <= new Date(task.due_date);
+
+    return new Response(
+      JSON.stringify({
+        feasible,
+        estimated_delivery: estimatedDelivery.toISOString(),
+        plan,
+        conflicts,
+        reason: feasible ? null : "One or more teams are overloaded"
+      }),
+      { status: 200 }
     );
 
-    return withCors({
-      feasible: true,
-      estimated_delivery: estimatedDelivery.toISOString(),
-      plan
-    });
-
   } catch (err) {
-    console.error("Analyzer crash:", err);
-    return withCors(
-      { feasible: false, reason: "Internal analyzer error" },
-      500
+    console.error("Analyze crash:", err);
+    return new Response(
+      JSON.stringify({ error: "Internal analysis error" }),
+      { status: 500 }
     );
   }
 }
