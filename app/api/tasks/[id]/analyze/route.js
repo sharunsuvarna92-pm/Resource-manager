@@ -1,138 +1,147 @@
-import { createClient } from "@supabase/supabase-js";
-
-export const runtime = "nodejs";
+import { NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+)
 
-// ------------------
-// Helpers
-// ------------------
-function addHours(date, hours) {
-  const d = new Date(date);
-  d.setHours(d.getHours() + hours);
-  return d;
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
 }
 
-function maxDate(dates) {
-  return new Date(Math.max(...dates.map(d => new Date(d).getTime())));
+export async function OPTIONS() {
+  return NextResponse.json({}, { headers: corsHeaders })
 }
 
-// ------------------
-// ANALYZE TASK
-// ------------------
-export async function POST(request, { params }) {
+export async function POST(
+  req: Request,
+  { params }: { params: { id: string } }
+) {
   try {
-    const { id: taskId } = await params;
+    const taskId = params.id
 
-    const { data: task } = await supabase
-      .from("tasks")
-      .select("*")
-      .eq("id", taskId)
-      .single();
+    /* -------------------------
+       1. Fetch task
+    -------------------------- */
+    const { data: task, error: taskError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', taskId)
+      .single()
 
-    if (!task) {
-      return new Response(
-        JSON.stringify({ error: "Task not found" }),
-        { status: 404 }
-      );
+    if (taskError || !task) {
+      return NextResponse.json(
+        { feasible: false, reason: 'Task not found' },
+        { status: 404, headers: corsHeaders }
+      )
     }
 
-    const { data: module } = await supabase
-      .from("modules")
-      .select("primary_roles_map, secondary_roles_map")
-      .eq("id", task.module_id)
-      .single();
+    const taskStart = new Date(task.start_date)
+    const taskDue = new Date(task.due_date)
 
+    /* -------------------------
+       2. Fetch committed assignments
+    -------------------------- */
     const { data: committedAssignments } = await supabase
-      .from("assignments")
-      .select("*")
-      .eq("status", "committed")
-      .neq("task_id", taskId);
+      .from('assignments')
+      .select('*')
+      .eq('status', 'committed')
 
-    const plan = {};
-    const conflicts = [];
-    const timelineEnd = {};
+    const teamWork = task.team_work || {}
 
-    for (const [team, work] of Object.entries(task.team_work)) {
-      const { effort_hours, depends_on = [] } = work;
+    const plan: any = {}
+    let feasible = true
+    let blockingReason = null
+    let latestEnd = taskStart
 
-      let start = depends_on.length
-        ? maxDate(depends_on.map(d => timelineEnd[d]).filter(Boolean))
-        : new Date(task.start_date);
+    /* -------------------------
+       3. Helper functions
+    -------------------------- */
+    const daysFromHours = (hours: number) =>
+      Math.ceil(hours / 8)
 
-      let assignedTo = module.primary_roles_map?.[team];
-      let autoShifted = false;
+    const addDays = (date: Date, days: number) => {
+      const d = new Date(date)
+      d.setDate(d.getDate() + days)
+      return d
+    }
 
-      const isAvailable = (memberId) => {
-        return committedAssignments
-          .filter(a => a.member_id === memberId)
-          .every(a =>
-            new Date(a.end_date) <= start ||
-            new Date(a.start_date) >= addHours(start, effort_hours)
-          );
-      };
+    const getTeamAvailability = (team: string) => {
+      const teamAssignments =
+        committedAssignments?.filter(a => a.source === team) || []
 
-      if (!isAvailable(assignedTo)) {
-        const secondaries = module.secondary_roles_map?.[team] || [];
-        const availableSecondary = secondaries.find(isAvailable);
+      if (teamAssignments.length === 0) return taskStart
 
-        if (availableSecondary) {
-          assignedTo = availableSecondary;
-          autoShifted = true;
-        } else {
-          const busyAssignments = committedAssignments.filter(
-            a => a.member_id === assignedTo
-          );
+      return new Date(
+        Math.max(
+          ...teamAssignments.map(a =>
+            new Date(a.end_date).getTime()
+          )
+        )
+      )
+    }
 
-          const latestEnd = maxDate(busyAssignments.map(a => a.end_date));
-          conflicts.push({
-            team,
-            member_id: assignedTo,
-            overlap_start: task.start_date,
-            overlap_end: latestEnd.toISOString()
-          });
+    /* -------------------------
+       4. Build plan respecting dependencies
+    -------------------------- */
+    for (const [team, config] of Object.entries(teamWork)) {
+      const effort = config.effort_hours || 0
+      const dependsOn: string[] = config.depends_on || []
 
-          start = latestEnd;
-          autoShifted = true;
-        }
+      let start = getTeamAvailability(team)
+
+      for (const dep of dependsOn) {
+        if (!plan[dep]) continue
+        start = new Date(
+          Math.max(start.getTime(), new Date(plan[dep].end_date).getTime())
+        )
       }
 
-      const end = addHours(start, effort_hours);
+      const durationDays = daysFromHours(effort)
+      const end = addDays(start, durationDays)
+
+      if (end > taskDue) {
+        feasible = false
+        blockingReason = `Team ${team} cannot complete before due date`
+      }
 
       plan[team] = {
-        assigned_to: assignedTo,
+        assigned_to: null, // filled on commit
         start_date: start.toISOString(),
         end_date: end.toISOString(),
-        effort_hours,
-        depends_on,
-        auto_shifted: autoShifted
-      };
+        effort_hours: effort,
+        depends_on: dependsOn,
+        auto_shifted: start > taskStart
+      }
 
-      timelineEnd[team] = end;
+      if (end > latestEnd) latestEnd = end
     }
 
-    const estimatedDelivery = maxDate(Object.values(timelineEnd));
-    const feasible = estimatedDelivery <= new Date(task.due_date);
-
-    return new Response(
-      JSON.stringify({
+    /* -------------------------
+       5. Final response
+    -------------------------- */
+    return NextResponse.json(
+      {
         feasible,
-        estimated_delivery: estimatedDelivery.toISOString(),
-        plan,
-        conflicts,
-        reason: feasible ? null : "One or more teams are overloaded"
-      }),
-      { status: 200 }
-    );
+        reason: feasible ? null : blockingReason,
+        estimated_delivery: latestEnd.toISOString(),
+        plan
+      },
+      { headers: corsHeaders }
+    )
+  } catch (err: any) {
+    console.error('Analyzer crash:', err)
 
-  } catch (err) {
-    console.error("Analyze crash:", err);
-    return new Response(
-      JSON.stringify({ error: "Internal analysis error" }),
-      { status: 500 }
-    );
+    return NextResponse.json(
+      {
+        feasible: false,
+        reason: 'Analyzer internal error',
+        details: err.message
+      },
+      { status: 500, headers: corsHeaders }
+    )
   }
 }
