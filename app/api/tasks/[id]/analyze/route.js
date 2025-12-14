@@ -6,9 +6,10 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ================= CONSTANTS ================= */
-const WORK_START_HOUR = 9;
-const WORK_END_HOUR = 17;
+/* ================= CONFIG ================= */
+
+const WORK_START_HOUR = 9;   // 9 AM
+const WORK_END_HOUR = 17;    // 5 PM
 const HOURS_PER_DAY = 8;
 
 /* ================= HELPERS ================= */
@@ -20,18 +21,37 @@ function isWeekend(date) {
 
 function nextWorkingDay(date) {
   const d = new Date(date);
-  while (isWeekend(d)) {
+  do {
     d.setDate(d.getDate() + 1);
-  }
+  } while (isWeekend(d));
   d.setHours(WORK_START_HOUR, 0, 0, 0);
+  return d;
+}
+
+function normalizeToWorkingStart(date) {
+  const d = new Date(date);
+
+  // Weekend → next working day
+  if (isWeekend(d)) {
+    return nextWorkingDay(d);
+  }
+
+  // After work hours → next working day
+  if (d.getHours() >= WORK_END_HOUR) {
+    return nextWorkingDay(d);
+  }
+
+  // Before work hours → same day 9 AM
+  if (d.getHours() < WORK_START_HOUR) {
+    d.setHours(WORK_START_HOUR, 0, 0, 0);
+  }
+
   return d;
 }
 
 function addWorkingHours(start, hours) {
   let remaining = hours;
-  let current = new Date(start);
-
-  current = nextWorkingDay(current);
+  let current = normalizeToWorkingStart(start);
 
   while (remaining > 0) {
     if (isWeekend(current)) {
@@ -43,15 +63,14 @@ function addWorkingHours(start, hours) {
     endOfDay.setHours(WORK_END_HOUR, 0, 0, 0);
 
     const availableToday =
-      (endOfDay - current) / (1000 * 60 * 60);
+      (endOfDay.getTime() - current.getTime()) / (1000 * 60 * 60);
 
     if (remaining <= availableToday) {
       current.setHours(current.getHours() + remaining);
       remaining = 0;
     } else {
       remaining -= availableToday;
-      current.setDate(current.getDate() + 1);
-      current.setHours(WORK_START_HOUR, 0, 0, 0);
+      current = nextWorkingDay(current);
     }
   }
 
@@ -98,7 +117,7 @@ export async function POST(req, { params }) {
 
   if (!module?.primary_roles_map) {
     return NextResponse.json(
-      { feasible: false, reason: "Module ownership missing" },
+      { feasible: false, reason: "Module ownership not defined" },
       { status: 400 }
     );
   }
@@ -133,6 +152,7 @@ export async function POST(req, { params }) {
         a => a.member_id === memberId
       );
 
+      /* ---- Dependency constraint ---- */
       const dependencyEnd = dependsOn
         .map(d => timeline[d]?.end_date)
         .filter(Boolean)
@@ -142,22 +162,30 @@ export async function POST(req, { params }) {
         );
 
       let start = new Date(task.start_date);
-      start.setHours(WORK_START_HOUR, 0, 0, 0);
 
       if (dependencyEnd && new Date(dependencyEnd) > start) {
         start = new Date(dependencyEnd);
       }
 
-      // push start if overlapping other work
+      start = normalizeToWorkingStart(start);
+
+      /* ---- Availability constraint ---- */
       for (const a of memberAssignments) {
-        if (overlaps(start, addWorkingHours(start, effort), a.start_date, a.end_date)) {
-          start = new Date(a.end_date);
+        if (
+          overlaps(
+            start,
+            addWorkingHours(start, effort),
+            a.start_date,
+            a.end_date
+          )
+        ) {
+          start = normalizeToWorkingStart(a.end_date);
         }
       }
 
-      start = nextWorkingDay(start);
       const end = addWorkingHours(start, effort);
 
+      /* ---- Due date check ---- */
       if (end <= new Date(task.due_date)) {
         timeline[team] = {
           assigned_to: memberId,
@@ -165,7 +193,9 @@ export async function POST(req, { params }) {
           end_date: end.toISOString(),
           effort_hours: effort,
           depends_on: dependsOn,
-          auto_shifted: true
+          auto_shifted:
+            start.getTime() !==
+            new Date(task.start_date).getTime()
         };
         plan[team] = timeline[team];
         assigned = true;
