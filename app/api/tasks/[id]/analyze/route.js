@@ -2,146 +2,132 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-}
-
+/* ------------------ CORS ------------------ */
 export async function OPTIONS() {
-  return NextResponse.json({}, { headers: corsHeaders })
+  return NextResponse.json({}, {
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
+    }
+  })
 }
 
-export async function POST(
-  req: Request,
-  { params }: { params: { id: string } }
-) {
+/* ------------------ HELPERS ------------------ */
+const addDays = (date, days) => {
+  const d = new Date(date)
+  d.setDate(d.getDate() + days)
+  return d
+}
+
+const safeDate = (value, fallback) => {
+  const d = new Date(value)
+  return isNaN(d.getTime()) ? new Date(fallback) : d
+}
+
+/* ------------------ ANALYZE ------------------ */
+export async function POST(req, { params }) {
   try {
     const taskId = params.id
 
-    /* -------------------------
-       1. Fetch task
-    -------------------------- */
-    const { data: task, error: taskError } = await supabase
+    /* ---------- 1. Load task ---------- */
+    const { data: task, error: taskErr } = await supabase
       .from('tasks')
       .select('*')
       .eq('id', taskId)
       .single()
 
-    if (taskError || !task) {
+    if (taskErr || !task) {
       return NextResponse.json(
         { feasible: false, reason: 'Task not found' },
-        { status: 404, headers: corsHeaders }
+        { status: 404 }
       )
     }
 
-    const taskStart = new Date(task.start_date)
-    const taskDue = new Date(task.due_date)
-
-    /* -------------------------
-       2. Fetch committed assignments
-    -------------------------- */
-    const { data: committedAssignments } = await supabase
+    /* ---------- 2. Load committed assignments ---------- */
+    const { data: committed } = await supabase
       .from('assignments')
       .select('*')
-      .eq('status', 'committed')
+      .eq('task_id', taskId)
+      .eq('status', 'Committed')
+
+    /* ---------- 3. Determine baseline start ---------- */
+    let baselineStart = safeDate(task.start_date, new Date())
+
+    if (committed && committed.length > 0) {
+      const latest = committed
+        .map(a => new Date(a.end_date))
+        .filter(d => !isNaN(d.getTime()))
+        .sort((a, b) => b - a)[0]
+
+      baselineStart = latest || baselineStart
+    }
+
+    /* ---------- 4. Build execution plan ---------- */
+    const plan = {}
+    let currentPointer = new Date(baselineStart)
 
     const teamWork = task.team_work || {}
 
-    const plan: any = {}
-    let feasible = true
-    let blockingReason = null
-    let latestEnd = taskStart
+    for (const team of Object.keys(teamWork)) {
+      const effort = teamWork[team].effort_hours || 0
+      const dependsOn = teamWork[team].depends_on || []
 
-    /* -------------------------
-       3. Helper functions
-    -------------------------- */
-    const daysFromHours = (hours: number) =>
-      Math.ceil(hours / 8)
+      // dependency resolution
+      if (dependsOn.length > 0) {
+        const depEndDates = dependsOn
+          .map(t => plan[t]?.end_date)
+          .filter(Boolean)
+          .map(d => new Date(d))
 
-    const addDays = (date: Date, days: number) => {
-      const d = new Date(date)
-      d.setDate(d.getDate() + days)
-      return d
-    }
-
-    const getTeamAvailability = (team: string) => {
-      const teamAssignments =
-        committedAssignments?.filter(a => a.source === team) || []
-
-      if (teamAssignments.length === 0) return taskStart
-
-      return new Date(
-        Math.max(
-          ...teamAssignments.map(a =>
-            new Date(a.end_date).getTime()
+        if (depEndDates.length > 0) {
+          currentPointer = new Date(
+            Math.max(...depEndDates.map(d => d.getTime()))
           )
-        )
-      )
-    }
-
-    /* -------------------------
-       4. Build plan respecting dependencies
-    -------------------------- */
-    for (const [team, config] of Object.entries(teamWork)) {
-      const effort = config.effort_hours || 0
-      const dependsOn: string[] = config.depends_on || []
-
-      let start = getTeamAvailability(team)
-
-      for (const dep of dependsOn) {
-        if (!plan[dep]) continue
-        start = new Date(
-          Math.max(start.getTime(), new Date(plan[dep].end_date).getTime())
-        )
+        }
       }
 
-      const durationDays = daysFromHours(effort)
-      const end = addDays(start, durationDays)
-
-      if (end > taskDue) {
-        feasible = false
-        blockingReason = `Team ${team} cannot complete before due date`
-      }
+      const start = new Date(currentPointer)
+      const end = addDays(start, Math.ceil(effort / 8))
 
       plan[team] = {
-        assigned_to: null, // filled on commit
+        assigned_to: teamWork[team].assigned_to || null,
+        effort_hours: effort,
         start_date: start.toISOString(),
         end_date: end.toISOString(),
-        effort_hours: effort,
         depends_on: dependsOn,
-        auto_shifted: start > taskStart
+        auto_shifted: true
       }
 
-      if (end > latestEnd) latestEnd = end
+      currentPointer = new Date(end)
     }
 
-    /* -------------------------
-       5. Final response
-    -------------------------- */
-    return NextResponse.json(
-      {
-        feasible,
-        reason: feasible ? null : blockingReason,
-        estimated_delivery: latestEnd.toISOString(),
-        plan
-      },
-      { headers: corsHeaders }
-    )
-  } catch (err: any) {
-    console.error('Analyzer crash:', err)
+    /* ---------- 5. Delivery decision ---------- */
+    const estimatedDelivery = currentPointer
+    const dueDate = safeDate(task.due_date, estimatedDelivery)
 
+    const feasible = estimatedDelivery <= dueDate
+
+    return NextResponse.json({
+      feasible,
+      estimated_delivery: estimatedDelivery.toISOString(),
+      reason: feasible ? null : 'Capacity overlap or dependency delay',
+      plan
+    }, {
+      headers: {
+        'Access-Control-Allow-Origin': '*'
+      }
+    })
+
+  } catch (err) {
+    console.error('Analyzer crash:', err)
     return NextResponse.json(
-      {
-        feasible: false,
-        reason: 'Analyzer internal error',
-        details: err.message
-      },
-      { status: 500, headers: corsHeaders }
+      { feasible: false, reason: 'Analyzer internal error' },
+      { status: 500 }
     )
   }
 }
