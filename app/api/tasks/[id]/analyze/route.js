@@ -9,14 +9,13 @@ const supabase = createClient(
 /* ================= CONFIG ================= */
 
 const IST_OFFSET_MIN = 330;
-const WORK_START = 9;   // 9 AM IST
-const WORK_END = 17;    // 5 PM IST
+const WORK_START = 9;
+const WORK_END = 17;
 
 /* ================= TIME HELPERS ================= */
 
 const toIST = d => new Date(new Date(d).getTime() + IST_OFFSET_MIN * 60000);
 const fromIST = d => new Date(new Date(d).getTime() - IST_OFFSET_MIN * 60000);
-
 const isWeekend = d => d.getDay() === 0 || d.getDay() === 6;
 
 function normalizeStart(d) {
@@ -63,32 +62,25 @@ function addWorkingHours(start, hours) {
   return current;
 }
 
-const maxDate = dates => new Date(Math.max(...dates.map(d => d.getTime())));
-
-/* ================= DUE DATE HELPER (FINAL CHANGE) ================= */
+const maxDate = dates =>
+  new Date(Math.max(...dates.map(d => d.getTime())));
 
 function endOfWorkDayIST(date) {
   const d = toIST(date);
-  d.setHours(17, 0, 0, 0); // 5:00 PM IST
+  d.setHours(17, 0, 0, 0);
   return d;
 }
 
-/* ================= TOPOLOGICAL SORT ================= */
+/* ================= TOPO SORT ================= */
 
 function topoSort(teamWork) {
   const visited = new Set();
-  const visiting = new Set();
   const order = [];
 
   function visit(team) {
     if (visited.has(team)) return;
-    if (visiting.has(team)) throw new Error("Circular dependency detected");
-
-    visiting.add(team);
-    for (const dep of teamWork[team].depends_on || []) visit(dep);
-    visiting.delete(team);
-
     visited.add(team);
+    for (const dep of teamWork[team].depends_on || []) visit(dep);
     order.push(team);
   }
 
@@ -112,8 +104,6 @@ export async function POST(req, { params }) {
   }
 
   const taskStart = ensureWorkingTime(toIST(task.start_date));
-
-  // ✅ FINAL: Due date = 5 PM IST on due date
   const dueDate = endOfWorkDayIST(task.due_date);
 
   const { data: module } = await supabase
@@ -122,24 +112,29 @@ export async function POST(req, { params }) {
     .eq("id", task.module_id)
     .single();
 
+  /* 🔥 FETCH COMMITTED ASSIGNMENTS WITH TASK METADATA */
   const { data: committed = [] } = await supabase
     .from("assignments")
-    .select("*")
+    .select(`
+      member_id,
+      task_id,
+      start_date,
+      end_date,
+      tasks (
+        title,
+        priority
+      )
+    `)
     .eq("status", "committed");
 
   const order = topoSort(task.team_work);
-
-  /* ---------- Owner availability ---------- */
 
   function earliestAvailability(memberId) {
     const busy = committed
       .filter(a => a.member_id === memberId)
       .map(a => toIST(a.end_date));
-
     return busy.length ? maxDate(busy) : taskStart;
   }
-
-  /* ---------- Build plan for a given owner map ---------- */
 
   function buildPlan(ownerMap) {
     const timeline = {};
@@ -149,10 +144,9 @@ export async function POST(req, { params }) {
       const dependsOn = task.team_work[team].depends_on || [];
       const owner = ownerMap[team];
 
-      const depEnd =
-        dependsOn.length > 0
-          ? maxDate(dependsOn.map(d => toIST(timeline[d].end_date)))
-          : taskStart;
+      const depEnd = dependsOn.length
+        ? maxDate(dependsOn.map(d => toIST(timeline[d].end_date)))
+        : taskStart;
 
       const ownerReady = owner
         ? earliestAvailability(owner)
@@ -181,7 +175,7 @@ export async function POST(req, { params }) {
     return { timeline, delivery };
   }
 
-  /* ---------- Generate all paths ---------- */
+  /* ---------- Generate paths ---------- */
 
   const teams = order;
   const paths = [];
@@ -193,16 +187,14 @@ export async function POST(req, { params }) {
     }
 
     const team = teams[idx];
-    const primary = module.primary_roles_map?.[team];
-    const secondary = module.secondary_roles_map?.[team]?.[0];
+    const p = module.primary_roles_map?.[team];
+    const s = module.secondary_roles_map?.[team]?.[0];
 
-    if (primary) generate(idx + 1, { ...map, [team]: primary });
-    if (secondary) generate(idx + 1, { ...map, [team]: secondary });
+    if (p) generate(idx + 1, { ...map, [team]: p });
+    if (s) generate(idx + 1, { ...map, [team]: s });
   }
 
   generate(0, {});
-
-  /* ---------- Select chosen path ---------- */
 
   const allPrimary = paths.find(p =>
     Object.values(p.timeline).every(t => t.owner_type === "primary")
@@ -216,7 +208,7 @@ export async function POST(req, { params }) {
     feasible = true;
   } else {
     const fitting = paths.filter(p => p.delivery <= dueDate);
-    if (fitting.length > 0) {
+    if (fitting.length) {
       chosen = fitting.sort((a, b) => a.delivery - b.delivery)[0];
       feasible = true;
     } else {
@@ -224,17 +216,50 @@ export async function POST(req, { params }) {
     }
   }
 
-  const blockingTeam = feasible
-    ? null
-    : Object.entries(allPrimary.timeline)
-        .sort(
-          (a, b) =>
-            new Date(b[1].end_date) - new Date(a[1].end_date)
-        )[0][0];
+  /* ================= BLOCKING REASON (NEW) ================= */
+
+  let blocking_reason = null;
+  let recommendation = null;
+
+  if (!feasible && allPrimary) {
+    const [blockingTeam, blockData] = Object.entries(allPrimary.timeline)
+      .sort((a, b) => new Date(b[1].end_date) - new Date(a[1].end_date))[0];
+
+    const memberId = blockData.assigned_to;
+    const conflict = committed
+      .filter(a => a.member_id === memberId)
+      .find(a => toIST(a.end_date) > taskStart);
+
+    if (conflict) {
+      blocking_reason = {
+        type: "RESOURCE_CONFLICT",
+        team: blockingTeam,
+        member_id: memberId,
+        conflicting_task: {
+          id: conflict.task_id,
+          title: conflict.tasks?.title,
+          priority: conflict.tasks?.priority
+        },
+        conflict_window: {
+          from: conflict.start_date,
+          to: conflict.end_date
+        },
+        message: `Task cannot be completed because the primary owner is already committed to a ${conflict.tasks?.priority || "higher"} priority task.`
+      };
+
+      recommendation = {
+        action: "REPRIORITIZE",
+        message:
+          "If this task has higher priority, consider reprioritizing the conflicting task or adjusting its due date."
+      };
+    }
+  }
 
   return NextResponse.json({
     feasible,
-    blocking_team: blockingTeam,
+    blocking_team: feasible ? null : blocking_reason?.team,
+    blocking_reason,
+    recommendation,
     estimated_delivery: fromIST(chosen.delivery).toISOString(),
     plan: chosen.timeline
   });
