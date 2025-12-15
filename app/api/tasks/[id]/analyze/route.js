@@ -14,17 +14,10 @@ const WORK_END = 17;
 
 /* ================= TIME HELPERS ================= */
 
-function toIST(date) {
-  return new Date(new Date(date).getTime() + IST_OFFSET_MIN * 60000);
-}
+const toIST = d => new Date(new Date(d).getTime() + IST_OFFSET_MIN * 60000);
+const fromIST = d => new Date(new Date(d).getTime() - IST_OFFSET_MIN * 60000);
 
-function fromIST(date) {
-  return new Date(new Date(date).getTime() - IST_OFFSET_MIN * 60000);
-}
-
-function isWeekend(d) {
-  return d.getDay() === 0 || d.getDay() === 6;
-}
+const isWeekend = d => d.getDay() === 0 || d.getDay() === 6;
 
 function normalizeStart(d) {
   const n = new Date(d);
@@ -34,9 +27,8 @@ function normalizeStart(d) {
 
 function nextWorkingDay(d) {
   const n = new Date(d);
-  do {
-    n.setDate(n.getDate() + 1);
-  } while (isWeekend(n));
+  do n.setDate(n.getDate() + 1);
+  while (isWeekend(n));
   return normalizeStart(n);
 }
 
@@ -71,40 +63,29 @@ function addWorkingHours(start, hours) {
   return current;
 }
 
-function maxDate(dates) {
-  return new Date(Math.max(...dates.map(d => d.getTime())));
-}
+const maxDate = dates => new Date(Math.max(...dates.map(d => d.getTime())));
 
-/* ================= TOPOLOGICAL SORT ================= */
+/* ================= TOPO SORT ================= */
 
 function topoSort(teamWork) {
   const visited = new Set();
   const visiting = new Set();
-  const result = [];
+  const order = [];
 
   function visit(team) {
     if (visited.has(team)) return;
-    if (visiting.has(team)) {
-      throw new Error(`Circular dependency detected at ${team}`);
-    }
+    if (visiting.has(team)) throw new Error("Circular dependency");
 
     visiting.add(team);
-
-    const deps = teamWork[team]?.depends_on || [];
-    for (const dep of deps) {
-      visit(dep);
-    }
-
+    for (const dep of teamWork[team].depends_on || []) visit(dep);
     visiting.delete(team);
+
     visited.add(team);
-    result.push(team);
+    order.push(team);
   }
 
-  for (const team of Object.keys(teamWork)) {
-    visit(team);
-  }
-
-  return result;
+  Object.keys(teamWork).forEach(visit);
+  return order;
 }
 
 /* ================= ANALYZE ================= */
@@ -118,12 +99,10 @@ export async function POST(req, { params }) {
     .eq("id", taskId)
     .single();
 
-  if (!task) {
-    return NextResponse.json({ feasible: false }, { status: 404 });
-  }
+  if (!task) return NextResponse.json({ feasible: false }, { status: 404 });
 
-  const taskStartIST = ensureWorkingTime(toIST(task.start_date));
-  const dueIST = ensureWorkingTime(toIST(task.due_date));
+  const taskStart = ensureWorkingTime(toIST(task.start_date));
+  const dueDate = ensureWorkingTime(toIST(task.due_date));
 
   const { data: module } = await supabase
     .from("modules")
@@ -136,68 +115,39 @@ export async function POST(req, { params }) {
     .select("*")
     .eq("status", "committed");
 
-  let executionOrder;
-  try {
-    executionOrder = topoSort(task.team_work);
-  } catch (err) {
-    return NextResponse.json(
-      { feasible: false, reason: err.message },
-      { status: 400 }
-    );
+  const order = topoSort(task.team_work);
+
+  /* -------- OWNER AVAILABILITY -------- */
+
+  function earliestAvailability(memberId) {
+    const busy = committed
+      .filter(a => a.member_id === memberId)
+      .map(a => toIST(a.end_date));
+
+    return busy.length ? maxDate(busy) : taskStart;
   }
 
-  function buildPlan(useSecondary) {
-    const timeline = {};
-    let feasible = true;
-    let blockingTeam = null;
+  /* -------- BUILD PLAN FOR A PATH -------- */
 
-    for (const team of executionOrder) {
+  function buildPlan(ownerMap) {
+    const timeline = {};
+
+    for (const team of order) {
       const effort = task.team_work[team].effort_hours;
       const dependsOn = task.team_work[team].depends_on || [];
+      const owner = ownerMap[team];
 
-      const owner = useSecondary
-        ? module.secondary_roles_map?.[team]?.[0]
-        : module.primary_roles_map?.[team];
+      const depEnd =
+        dependsOn.length > 0
+          ? maxDate(dependsOn.map(d => toIST(timeline[d].end_date)))
+          : taskStart;
 
-      const dependencyEndDates = dependsOn.map(
-        dep => toIST(timeline[dep].end_date)
-      );
+      const ownerReady = owner
+        ? earliestAvailability(owner)
+        : depEnd;
 
-      const dependencyReady =
-        dependencyEndDates.length > 0
-          ? maxDate(dependencyEndDates)
-          : taskStartIST;
-
-      if (!owner) {
-        feasible = false;
-        blockingTeam ??= team;
-
-        timeline[team] = {
-          assigned_to: null,
-          start_date: fromIST(dependencyReady).toISOString(),
-          end_date: fromIST(dependencyReady).toISOString(),
-          effort_hours: effort,
-          depends_on: dependsOn,
-          blocked: true,
-          blocked_reason: "No available owner"
-        };
-        continue;
-      }
-
-      const busyUntilDates = committed
-        .filter(a => a.member_id === owner)
-        .map(a => toIST(a.end_date));
-
-      const availableFrom =
-        busyUntilDates.length > 0
-          ? maxDate(busyUntilDates)
-          : taskStartIST;
-
-      const start = ensureWorkingTime(
-        maxDate([dependencyReady, availableFrom])
-      );
-
-      const end = addWorkingHours(start, effort);
+      const start = ensureWorkingTime(maxDate([depEnd, ownerReady]));
+      const end = owner ? addWorkingHours(start, effort) : start;
 
       timeline[team] = {
         assigned_to: owner,
@@ -205,55 +155,75 @@ export async function POST(req, { params }) {
         end_date: fromIST(end).toISOString(),
         effort_hours: effort,
         depends_on: dependsOn,
-        auto_shifted:
-          start.getTime() !== taskStartIST.getTime() ||
-          dependencyEndDates.length > 0,
-        owner_type: useSecondary ? "secondary" : "primary"
+        owner_type:
+          owner === module.primary_roles_map[team]
+            ? "primary"
+            : "secondary"
       };
-
-      if (end > dueIST) {
-        feasible = false;
-        blockingTeam ??= team;
-      }
     }
 
     const delivery = maxDate(
       Object.values(timeline).map(t => toIST(t.end_date))
     );
 
-    return { feasible, blockingTeam, delivery, timeline };
+    return { timeline, delivery };
   }
 
-  const primaryPlan = buildPlan(false);
-  const secondaryPlan = buildPlan(true);
+  /* -------- GENERATE PATHS -------- */
+
+  const teams = order;
+  const paths = [];
+
+  function generate(idx, map) {
+    if (idx === teams.length) {
+      paths.push(buildPlan(map));
+      return;
+    }
+
+    const team = teams[idx];
+    const primary = module.primary_roles_map?.[team];
+    const secondary = module.secondary_roles_map?.[team]?.[0];
+
+    if (primary) generate(idx + 1, { ...map, [team]: primary });
+    if (secondary) generate(idx + 1, { ...map, [team]: secondary });
+  }
+
+  generate(0, {});
+
+  /* -------- SELECT PATH -------- */
+
+  const allPrimary = paths.find(p =>
+    Object.values(p.timeline).every(t => t.owner_type === "primary")
+  );
 
   let chosen;
-  let feasible;
+  let feasible = false;
 
-  if (primaryPlan.feasible) {
-    chosen = primaryPlan;
-    feasible = true;
-  } else if (secondaryPlan.feasible) {
-    chosen = secondaryPlan;
+  if (allPrimary && allPrimary.delivery <= dueDate) {
+    chosen = allPrimary;
     feasible = true;
   } else {
-    feasible = false;
-    chosen =
-      primaryPlan.delivery <= secondaryPlan.delivery
-        ? primaryPlan
-        : secondaryPlan;
+    const fitting = paths.filter(p => p.delivery <= dueDate);
+    if (fitting.length > 0) {
+      chosen = fitting.sort((a, b) => a.delivery - b.delivery)[0];
+      feasible = true;
+    } else {
+      chosen = paths.sort((a, b) => a.delivery - b.delivery)[0];
+    }
   }
 
-  const blockingTeam = feasible ? null : chosen.blockingTeam;
-
-  const estimatedDelivery = feasible
-    ? chosen.delivery
-    : toIST(chosen.timeline[blockingTeam].end_date);
+  const blockingTeam = feasible
+    ? null
+    : Object.entries(allPrimary.timeline)
+        .sort(
+          (a, b) =>
+            new Date(b[1].end_date) - new Date(a[1].end_date)
+        )[0][0];
 
   return NextResponse.json({
     feasible,
     blocking_team: blockingTeam,
-    estimated_delivery: fromIST(estimatedDelivery).toISOString(),
+    estimated_delivery: fromIST(chosen.delivery).toISOString(),
     plan: chosen.timeline
   });
 }
