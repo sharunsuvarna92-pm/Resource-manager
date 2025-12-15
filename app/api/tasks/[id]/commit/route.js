@@ -143,7 +143,7 @@ export async function POST(request, { params }) {
     await supabase
       .from("tasks")
       .update({
-        status: "committed",
+        status: "IN_PROGRESS",
         committed_at: new Date().toISOString(),
         expected_delivery_date: estimated_delivery, // ✅ ONLY FIX
       })
