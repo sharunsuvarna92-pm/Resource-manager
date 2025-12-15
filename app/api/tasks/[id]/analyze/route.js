@@ -9,8 +9,8 @@ const supabase = createClient(
 /* ================= CONFIG ================= */
 
 const IST_OFFSET_MIN = 330;
-const WORK_START = 9;
-const WORK_END = 17;
+const WORK_START = 9;   // 9 AM IST
+const WORK_END = 17;    // 5 PM IST
 
 /* ================= TIME HELPERS ================= */
 
@@ -65,7 +65,15 @@ function addWorkingHours(start, hours) {
 
 const maxDate = dates => new Date(Math.max(...dates.map(d => d.getTime())));
 
-/* ================= TOPO SORT ================= */
+/* ================= DUE DATE HELPER (FINAL CHANGE) ================= */
+
+function endOfWorkDayIST(date) {
+  const d = toIST(date);
+  d.setHours(17, 0, 0, 0); // 5:00 PM IST
+  return d;
+}
+
+/* ================= TOPOLOGICAL SORT ================= */
 
 function topoSort(teamWork) {
   const visited = new Set();
@@ -74,7 +82,7 @@ function topoSort(teamWork) {
 
   function visit(team) {
     if (visited.has(team)) return;
-    if (visiting.has(team)) throw new Error("Circular dependency");
+    if (visiting.has(team)) throw new Error("Circular dependency detected");
 
     visiting.add(team);
     for (const dep of teamWork[team].depends_on || []) visit(dep);
@@ -99,10 +107,14 @@ export async function POST(req, { params }) {
     .eq("id", taskId)
     .single();
 
-  if (!task) return NextResponse.json({ feasible: false }, { status: 404 });
+  if (!task) {
+    return NextResponse.json({ feasible: false }, { status: 404 });
+  }
 
   const taskStart = ensureWorkingTime(toIST(task.start_date));
-  const dueDate = ensureWorkingTime(toIST(task.due_date));
+
+  // ✅ FINAL: Due date = 5 PM IST on due date
+  const dueDate = endOfWorkDayIST(task.due_date);
 
   const { data: module } = await supabase
     .from("modules")
@@ -117,7 +129,7 @@ export async function POST(req, { params }) {
 
   const order = topoSort(task.team_work);
 
-  /* -------- OWNER AVAILABILITY -------- */
+  /* ---------- Owner availability ---------- */
 
   function earliestAvailability(memberId) {
     const busy = committed
@@ -127,7 +139,7 @@ export async function POST(req, { params }) {
     return busy.length ? maxDate(busy) : taskStart;
   }
 
-  /* -------- BUILD PLAN FOR A PATH -------- */
+  /* ---------- Build plan for a given owner map ---------- */
 
   function buildPlan(ownerMap) {
     const timeline = {};
@@ -169,7 +181,7 @@ export async function POST(req, { params }) {
     return { timeline, delivery };
   }
 
-  /* -------- GENERATE PATHS -------- */
+  /* ---------- Generate all paths ---------- */
 
   const teams = order;
   const paths = [];
@@ -190,7 +202,7 @@ export async function POST(req, { params }) {
 
   generate(0, {});
 
-  /* -------- SELECT PATH -------- */
+  /* ---------- Select chosen path ---------- */
 
   const allPrimary = paths.find(p =>
     Object.values(p.timeline).every(t => t.owner_type === "primary")
