@@ -34,7 +34,6 @@ export async function OPTIONS() {
 // ------------------
 export async function POST(request, { params }) {
   try {
-    // App Router params are async
     const { id: taskId } = await params;
 
     if (!taskId) {
@@ -45,7 +44,7 @@ export async function POST(request, { params }) {
     }
 
     // ------------------
-    // Parse & validate body FIRST
+    // Parse body
     // ------------------
     let body;
     try {
@@ -74,7 +73,7 @@ export async function POST(request, { params }) {
     }
 
     // ------------------
-    // Build assignments IN MEMORY (NO DB WRITE YET)
+    // Build assignments IN MEMORY
     // ------------------
     const assignmentRows = [];
 
@@ -109,54 +108,40 @@ export async function POST(request, { params }) {
       });
     }
 
-    if (assignmentRows.length === 0) {
+    // ------------------
+    // 🔒 CRITICAL FIX: verify task update ACTUALLY happens
+    // ------------------
+    const { data: updatedTask, error: taskUpdateError } = await supabase
+      .from("tasks")
+      .update({
+        status: "committed",
+        committed_at: new Date().toISOString(),
+        expected_delivery_date: estimated_delivery,
+      })
+      .eq("id", taskId)
+      .select()
+      .single();
+
+    if (taskUpdateError || !updatedTask) {
+      console.error("TASK UPDATE FAILED:", taskUpdateError);
       return withCors(
         {
           success: false,
-          reason: "No valid assignments generated from plan. Commit aborted.",
+          reason: "Task update failed during commit",
         },
-        400
+        500
       );
     }
 
     // ------------------
-    // Verify task exists
+    // Replace assignments
     // ------------------
-    const { data: task } = await supabase
-      .from("tasks")
-      .select("id")
-      .eq("id", taskId)
-      .single();
-
-    if (!task) {
-      return withCors(
-        { success: false, reason: "Task not found" },
-        404
-      );
-    }
-
-    // ------------------
-    // NOW it is SAFE to modify DB
-    // ------------------
-
-    // 1️⃣ Update task
-    await supabase
-      .from("tasks")
-      .update({
-        status: "IN_PROGRESS",
-        committed_at: new Date().toISOString(),
-        expected_delivery_date: estimated_delivery, // ✅ ONLY FIX
-      })
-      .eq("id", taskId);
-
-    // 2️⃣ Remove old draft / non-committed assignments
     await supabase
       .from("assignments")
       .delete()
       .eq("task_id", taskId)
       .neq("status", "committed");
 
-    // 3️⃣ Insert committed assignments
     await supabase
       .from("assignments")
       .insert(assignmentRows);
@@ -164,6 +149,8 @@ export async function POST(request, { params }) {
     return withCors({
       success: true,
       message: "Task and assignments committed successfully",
+      task_id: taskId,
+      expected_delivery_date: updatedTask.expected_delivery_date,
       assignments_created: assignmentRows.length,
     });
 
