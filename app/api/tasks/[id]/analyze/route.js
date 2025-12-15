@@ -9,9 +9,8 @@ const supabase = createClient(
 /* ================= CONFIG ================= */
 
 const IST_OFFSET_MIN = 330; // +05:30
-const WORK_START = 9;       // 09:00
-const WORK_END = 17;        // 17:00
-const HOURS_PER_DAY = 8;
+const WORK_START = 9;       // 09:00 IST
+const WORK_END = 17;        // 17:00 IST
 
 /* ================= TIME HELPERS ================= */
 
@@ -48,17 +47,9 @@ function nextWorkingDay(d) {
 function ensureWorkingTime(d) {
   const nd = new Date(d);
 
-  if (isWeekend(nd)) {
-    return nextWorkingDay(nd);
-  }
-
-  if (nd.getHours() < WORK_START) {
-    return normalizeToWorkStart(nd);
-  }
-
-  if (nd.getHours() >= WORK_END) {
-    return nextWorkingDay(nd);
-  }
+  if (isWeekend(nd)) return nextWorkingDay(nd);
+  if (nd.getHours() < WORK_START) return normalizeToWorkStart(nd);
+  if (nd.getHours() >= WORK_END) return nextWorkingDay(nd);
 
   return nd;
 }
@@ -95,6 +86,7 @@ function maxDate(dates) {
 export async function POST(req, { params }) {
   const { id: taskId } = await params;
 
+  /* ---------- Fetch task ---------- */
   const { data: task } = await supabase
     .from("tasks")
     .select("*")
@@ -102,23 +94,29 @@ export async function POST(req, { params }) {
     .single();
 
   if (!task) {
-    return NextResponse.json({ feasible: false }, { status: 404 });
+    return NextResponse.json(
+      { feasible: false, reason: "Task not found" },
+      { status: 404 }
+    );
   }
 
   const taskStartIST = ensureWorkingTime(toIST(task.start_date));
   const dueIST = ensureWorkingTime(toIST(task.due_date));
 
+  /* ---------- Fetch module owners ---------- */
   const { data: module } = await supabase
     .from("modules")
     .select("primary_roles_map, secondary_roles_map")
     .eq("id", task.module_id)
     .single();
 
+  /* ---------- Fetch committed assignments ---------- */
   const { data: committed = [] } = await supabase
     .from("assignments")
     .select("*")
     .eq("status", "committed");
 
+  /* ---------- Build candidate plan ---------- */
   function buildPlan(useSecondary) {
     const timeline = {};
     let feasible = true;
@@ -138,20 +136,29 @@ export async function POST(req, { params }) {
         continue;
       }
 
-      const dependencyEnd = dependsOn.length
-        ? maxDate(dependsOn.map(d => new Date(timeline[d].end_date)))
-        : taskStartIST;
+      /* ---- Dependency-safe handling (NO CRASH) ---- */
+      const dependencyEndDates = dependsOn
+        .map(dep => timeline[dep]?.end_date)
+        .filter(Boolean)
+        .map(d => toIST(d));
 
-      const busyUntil = committed
+      const dependencyReady =
+        dependencyEndDates.length > 0
+          ? maxDate(dependencyEndDates)
+          : taskStartIST;
+
+      /* ---- Member availability ---- */
+      const busyUntilDates = committed
         .filter(a => a.member_id === owner)
         .map(a => toIST(a.end_date));
 
-      const availableFrom = busyUntil.length
-        ? maxDate(busyUntil)
-        : taskStartIST;
+      const availableFrom =
+        busyUntilDates.length > 0
+          ? maxDate(busyUntilDates)
+          : taskStartIST;
 
       const start = ensureWorkingTime(
-        maxDate([dependencyEnd, availableFrom])
+        maxDate([dependencyReady, availableFrom])
       );
 
       const end = addWorkingHours(start, effort);
@@ -162,7 +169,10 @@ export async function POST(req, { params }) {
         end_date: fromIST(end).toISOString(),
         effort_hours: effort,
         depends_on: dependsOn,
-        auto_shifted: start > taskStartIST
+        auto_shifted:
+          start.getTime() !== taskStartIST.getTime() ||
+          dependencyEndDates.length > 0,
+        owner_type: useSecondary ? "secondary" : "primary"
       };
 
       if (end > dueIST) {
@@ -178,10 +188,13 @@ export async function POST(req, { params }) {
     return { feasible, blockingTeam, delivery, timeline };
   }
 
+  /* ---------- Evaluate plans ---------- */
   const primaryPlan = buildPlan(false);
   const secondaryPlan = buildPlan(true);
 
-  let chosen, feasible;
+  /* ---------- Select final plan ---------- */
+  let chosen;
+  let feasible;
 
   if (primaryPlan.feasible) {
     chosen = primaryPlan;
@@ -203,6 +216,7 @@ export async function POST(req, { params }) {
     ? chosen.delivery
     : toIST(chosen.timeline[blockingTeam].end_date);
 
+  /* ---------- Response ---------- */
   return NextResponse.json({
     feasible,
     blocking_team: blockingTeam,
