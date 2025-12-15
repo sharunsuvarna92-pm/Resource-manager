@@ -6,54 +6,80 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ---------------- Time Helpers (IST) ---------------- */
+/* ================= CONFIG ================= */
 
-const WORK_START_HOUR = 9;
-const WORK_END_HOUR = 17;
+const IST_OFFSET_MIN = 330; // +05:30
+const WORK_START = 9;       // 09:00
+const WORK_END = 17;        // 17:00
 const HOURS_PER_DAY = 8;
 
+/* ================= TIME HELPERS ================= */
+
 function toIST(date) {
-  return new Date(
-    new Date(date).toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
-  );
-}
-
-function isWeekend(date) {
-  const d = date.getDay();
-  return d === 0 || d === 6;
-}
-
-function nextWorkingDay(date) {
   const d = new Date(date);
-  while (isWeekend(d)) d.setDate(d.getDate() + 1);
-  d.setHours(WORK_START_HOUR, 0, 0, 0);
-  return d;
+  return new Date(d.getTime() + IST_OFFSET_MIN * 60 * 1000);
+}
+
+function fromIST(date) {
+  const d = new Date(date);
+  return new Date(d.getTime() - IST_OFFSET_MIN * 60 * 1000);
+}
+
+function isWeekend(d) {
+  const day = d.getDay();
+  return day === 0 || day === 6;
+}
+
+function normalizeToWorkStart(d) {
+  const nd = new Date(d);
+  nd.setHours(WORK_START, 0, 0, 0);
+  return nd;
+}
+
+function nextWorkingDay(d) {
+  const nd = new Date(d);
+  nd.setDate(nd.getDate() + 1);
+  while (isWeekend(nd)) {
+    nd.setDate(nd.getDate() + 1);
+  }
+  return normalizeToWorkStart(nd);
+}
+
+function ensureWorkingTime(d) {
+  const nd = new Date(d);
+
+  if (isWeekend(nd)) {
+    return nextWorkingDay(nd);
+  }
+
+  if (nd.getHours() < WORK_START) {
+    return normalizeToWorkStart(nd);
+  }
+
+  if (nd.getHours() >= WORK_END) {
+    return nextWorkingDay(nd);
+  }
+
+  return nd;
 }
 
 function addWorkingHours(start, hours) {
   let remaining = hours;
-  let current = new Date(start);
+  let current = ensureWorkingTime(start);
 
   while (remaining > 0) {
-    if (isWeekend(current)) {
-      current = nextWorkingDay(current);
-      continue;
-    }
-
     const endOfDay = new Date(current);
-    endOfDay.setHours(WORK_END_HOUR, 0, 0, 0);
+    endOfDay.setHours(WORK_END, 0, 0, 0);
 
     const available =
-      (endOfDay - current) / (1000 * 60 * 60);
+      (endOfDay.getTime() - current.getTime()) / (1000 * 60 * 60);
 
     if (remaining <= available) {
       current.setHours(current.getHours() + remaining);
       remaining = 0;
     } else {
       remaining -= available;
-      current = nextWorkingDay(
-        new Date(current.setDate(current.getDate() + 1))
-      );
+      current = nextWorkingDay(current);
     }
   }
 
@@ -64,12 +90,11 @@ function maxDate(dates) {
   return new Date(Math.max(...dates.map(d => d.getTime())));
 }
 
-/* ---------------- Core Analyze ---------------- */
+/* ================= ANALYZE ================= */
 
 export async function POST(req, { params }) {
   const { id: taskId } = await params;
 
-  /* ---------- Fetch task ---------- */
   const { data: task } = await supabase
     .from("tasks")
     .select("*")
@@ -77,32 +102,24 @@ export async function POST(req, { params }) {
     .single();
 
   if (!task) {
-    return NextResponse.json(
-      { feasible: false, reason: "Task not found" },
-      { status: 404 }
-    );
+    return NextResponse.json({ feasible: false }, { status: 404 });
   }
 
-  const dueDate = toIST(task.due_date);
-  const taskStart = nextWorkingDay(toIST(task.start_date));
+  const taskStartIST = ensureWorkingTime(toIST(task.start_date));
+  const dueIST = ensureWorkingTime(toIST(task.due_date));
 
-  /* ---------- Fetch module owners ---------- */
   const { data: module } = await supabase
     .from("modules")
     .select("primary_roles_map, secondary_roles_map")
     .eq("id", task.module_id)
     .single();
 
-  /* ---------- Fetch committed assignments ---------- */
   const { data: committed = [] } = await supabase
     .from("assignments")
     .select("*")
     .eq("status", "committed");
 
-  /* ---------- Build candidate plans ---------- */
-  const candidates = [];
-
-  function buildPlan(useSecondary = false) {
+  function buildPlan(useSecondary) {
     const timeline = {};
     let feasible = true;
     let blockingTeam = null;
@@ -111,10 +128,9 @@ export async function POST(req, { params }) {
       const effort = task.team_work[team].effort_hours;
       const dependsOn = task.team_work[team].depends_on || [];
 
-      const owner =
-        !useSecondary
-          ? module.primary_roles_map?.[team]
-          : module.secondary_roles_map?.[team]?.[0];
+      const owner = useSecondary
+        ? module.secondary_roles_map?.[team]?.[0]
+        : module.primary_roles_map?.[team];
 
       if (!owner) {
         feasible = false;
@@ -122,42 +138,34 @@ export async function POST(req, { params }) {
         continue;
       }
 
-      const dependencyEndDates = dependsOn
-        .map(d => timeline[d]?.end_date)
-        .filter(Boolean)
-        .map(d => toIST(d));
+      const dependencyEnd = dependsOn.length
+        ? maxDate(dependsOn.map(d => new Date(timeline[d].end_date)))
+        : taskStartIST;
 
-      const dependencyReady =
-        dependencyEndDates.length > 0
-          ? maxDate(dependencyEndDates)
-          : taskStart;
-
-      const memberBusyUntil = committed
+      const busyUntil = committed
         .filter(a => a.member_id === owner)
         .map(a => toIST(a.end_date));
 
-      const availableFrom =
-        memberBusyUntil.length > 0
-          ? maxDate(memberBusyUntil)
-          : taskStart;
+      const availableFrom = busyUntil.length
+        ? maxDate(busyUntil)
+        : taskStartIST;
 
-      let start = nextWorkingDay(
-        maxDate([dependencyReady, availableFrom])
+      const start = ensureWorkingTime(
+        maxDate([dependencyEnd, availableFrom])
       );
 
       const end = addWorkingHours(start, effort);
 
       timeline[team] = {
         assigned_to: owner,
-        start_date: start.toISOString(),
-        end_date: end.toISOString(),
+        start_date: fromIST(start).toISOString(),
+        end_date: fromIST(end).toISOString(),
         effort_hours: effort,
         depends_on: dependsOn,
-        auto_shifted:
-          start > taskStart || dependencyEndDates.length > 0
+        auto_shifted: start > taskStartIST
       };
 
-      if (end > dueDate) {
+      if (end > dueIST) {
         feasible = false;
         blockingTeam = team;
       }
@@ -167,22 +175,13 @@ export async function POST(req, { params }) {
       Object.values(timeline).map(t => toIST(t.end_date))
     );
 
-    return {
-      feasible,
-      blockingTeam,
-      delivery,
-      timeline,
-      usesSecondary: useSecondary
-    };
+    return { feasible, blockingTeam, delivery, timeline };
   }
 
   const primaryPlan = buildPlan(false);
   const secondaryPlan = buildPlan(true);
 
-  /* ---------- Select final plan ---------- */
-
-  let chosen;
-  let feasible;
+  let chosen, feasible;
 
   if (primaryPlan.feasible) {
     chosen = primaryPlan;
@@ -198,8 +197,6 @@ export async function POST(req, { params }) {
         : secondaryPlan;
   }
 
-  /* ---------- Final response ---------- */
-
   const blockingTeam = feasible ? null : chosen.blockingTeam;
 
   const estimatedDelivery = feasible
@@ -209,7 +206,7 @@ export async function POST(req, { params }) {
   return NextResponse.json({
     feasible,
     blocking_team: blockingTeam,
-    estimated_delivery: estimatedDelivery.toISOString(),
+    estimated_delivery: fromIST(estimatedDelivery).toISOString(),
     plan: chosen.timeline
   });
 }
