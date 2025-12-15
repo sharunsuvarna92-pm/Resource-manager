@@ -60,7 +60,7 @@ export async function POST(request, { params }) {
       );
     }
 
-    const { plan, estimated_delivery } = body;
+    const { plan } = body;
 
     if (!plan || typeof plan !== "object" || Object.keys(plan).length === 0) {
       return withCors(
@@ -71,6 +71,14 @@ export async function POST(request, { params }) {
         400
       );
     }
+
+    // ------------------
+    // 🔑 DERIVE EXPECTED DELIVERY FROM PLAN (FINAL FIX)
+    // ------------------
+    const expectedDeliveryFromPlan = Object.values(plan)
+      .map(t => new Date(t.end_date))
+      .reduce((max, d) => (d > max ? d : max), new Date(0))
+      .toISOString();
 
     // ------------------
     // Build assignments IN MEMORY
@@ -109,26 +117,23 @@ export async function POST(request, { params }) {
     }
 
     // ------------------
-    // 🔒 CRITICAL FIX: verify task update ACTUALLY happens
+    // Update task (GUARANTEED expected_delivery_date)
     // ------------------
     const { data: updatedTask, error: taskUpdateError } = await supabase
       .from("tasks")
       .update({
         status: "committed",
         committed_at: new Date().toISOString(),
-        expected_delivery_date: estimated_delivery,
+        expected_delivery_date: expectedDeliveryFromPlan, // ✅ FINAL
       })
       .eq("id", taskId)
       .select()
       .single();
 
     if (taskUpdateError || !updatedTask) {
-      console.error("TASK UPDATE FAILED:", taskUpdateError);
+      console.error("Task update failed:", taskUpdateError);
       return withCors(
-        {
-          success: false,
-          reason: "Task update failed during commit",
-        },
+        { success: false, reason: "Task update failed during commit" },
         500
       );
     }
@@ -150,7 +155,7 @@ export async function POST(request, { params }) {
       success: true,
       message: "Task and assignments committed successfully",
       task_id: taskId,
-      expected_delivery_date: updatedTask.expected_delivery_date,
+      expected_delivery_date: expectedDeliveryFromPlan,
       assignments_created: assignmentRows.length,
     });
 
