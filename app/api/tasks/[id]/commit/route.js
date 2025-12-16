@@ -122,7 +122,7 @@ export async function POST(request, { params }) {
     const { data: updatedTask, error: taskUpdateError } = await supabase
       .from("tasks")
       .update({
-        status: "committed",
+        status: "COMMITTED",
         committed_at: new Date().toISOString(),
         expected_delivery_date: expectedDeliveryFromPlan, // ✅ FINAL
       })

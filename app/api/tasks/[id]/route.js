@@ -2,164 +2,116 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// ------------------
-// Supabase client
-// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // ------------------
-// EDIT TASK (PLANNING ONLY)
+// UPDATE TASK STATUS
 // ------------------
-export async function PUT(request, { params }) {
+export async function PATCH(request, { params }) {
   try {
-    // ✅ App Router params are async
     const { id: taskId } = await params;
+    const { status: newStatus } = await request.json();
 
-    if (!taskId) {
+    if (!taskId || !newStatus) {
       return new Response(
-        JSON.stringify({ error: "Task ID missing in route" }),
+        JSON.stringify({ error: "Task ID and status are required" }),
         { status: 400 }
       );
     }
 
-    const body = await request.json();
-    const {
-      title,
-      description,
-      start_date,
-      due_date,
-      teams_involved,
-      team_work
-    } = body;
+    const allowedStatuses = [
+      "PLANNING",
+      "COMMITTED",
+      "ON_HOLD",
+      "COMPLETED",
+      "CANCELLED"
+    ];
+
+    if (!allowedStatuses.includes(newStatus)) {
+      return new Response(
+        JSON.stringify({ error: "Invalid task status" }),
+        { status: 400 }
+      );
+    }
 
     // ------------------
     // Fetch task
     // ------------------
-    const { data: task, error: taskFetchError } = await supabase
+    const { data: task, error } = await supabase
       .from("tasks")
-      .select("*")
+      .select("status")
       .eq("id", taskId)
       .single();
 
-    if (taskFetchError || !task) {
+    if (error || !task) {
       return new Response(
         JSON.stringify({ error: "Task not found" }),
         { status: 404 }
       );
     }
 
-    // ------------------
-    // Enforce PLANNING only
-    // ------------------
-    if (task.status !== "PLANNING") {
-      return new Response(
-        JSON.stringify({
-          error: "Only tasks in PLANNING status can be edited"
-        }),
-        { status: 400 }
-      );
-    }
+    const oldStatus = task.status;
 
     // ------------------
-    // Fetch module owners
-    // ------------------
-    const { data: module, error: moduleError } = await supabase
-      .from("modules")
-      .select("primary_roles_map")
-      .eq("id", task.module_id)
-      .single();
-
-    if (moduleError || !module) {
-      return new Response(
-        JSON.stringify({ error: "Invalid module configuration" }),
-        { status: 400 }
-      );
-    }
-
-    // ------------------
-    // Update task
-    // ------------------
-    const { error: taskUpdateError } = await supabase
-      .from("tasks")
-      .update({
-        title,
-        description,
-        start_date,
-        due_date,
-        teams_involved,
-        team_work
-      })
-      .eq("id", taskId);
-
-    if (taskUpdateError) {
-      console.error("Task update error:", taskUpdateError);
-      return new Response(
-        JSON.stringify({ error: taskUpdateError.message }),
-        { status: 500 }
-      );
-    }
-
-    // ------------------
-    // Delete existing DRAFT assignments
+    // Update task status
     // ------------------
     await supabase
-      .from("assignments")
-      .delete()
-      .eq("task_id", taskId)
-      .eq("status", "draft");
+      .from("tasks")
+      .update({ status: newStatus })
+      .eq("id", taskId);
 
     // ------------------
-    // Recreate draft assignments
+    // Assignment side-effects
     // ------------------
-    const assignments = [];
 
-    for (const team of teams_involved) {
-      const primaryOwner = module.primary_roles_map?.[team];
-
-      if (!primaryOwner) {
-        return new Response(
-          JSON.stringify({
-            error: `Primary owner not defined for team ${team}`
-          }),
-          { status: 400 }
-        );
-      }
-
-      assignments.push({
-        task_id: taskId,
-        team,
-        member_id: primaryOwner,
-        start_date,
-        end_date: due_date,
-        assigned_hours: team_work[team]?.effort_hours || 0,
-        status: "draft",
-        source: "auto",
-        created_at: new Date().toISOString()
-      });
+    // 🔁 Back to planning OR on hold
+    if (newStatus === "PLANNING" || newStatus === "ON_HOLD") {
+      await supabase
+        .from("assignments")
+        .update({ status: "draft" })
+        .eq("task_id", taskId)
+        .neq("status", "completed");
     }
 
-    const { error: assignmentError } = await supabase
-      .from("assignments")
-      .insert(assignments);
+    // ▶ Commit
+    if (newStatus === "COMMITTED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "committed" })
+        .eq("task_id", taskId)
+        .eq("status", "draft");
+    }
 
-    if (assignmentError) {
-      console.error("Draft assignment recreate error:", assignmentError);
-      return new Response(
-        JSON.stringify({ error: assignmentError.message }),
-        { status: 500 }
-      );
+    // ✅ Complete
+    if (newStatus === "COMPLETED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "completed" })
+        .eq("task_id", taskId);
+    }
+
+    // ❌ Cancel
+    if (newStatus === "CANCELLED") {
+      await supabase
+        .from("assignments")
+        .delete()
+        .eq("task_id", taskId);
     }
 
     return new Response(
-      JSON.stringify({ success: true }),
+      JSON.stringify({
+        success: true,
+        old_status: oldStatus,
+        new_status: newStatus
+      }),
       { status: 200 }
     );
 
   } catch (err) {
-    console.error("Edit task crash:", err);
+    console.error("Status update error:", err);
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
       { status: 500 }
