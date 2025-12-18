@@ -1,31 +1,28 @@
 import { NextResponse } from "next/server";
 
+/**
+ * IMPORTANT:
+ * Do NOT intercept API routes.
+ * API routes handle their own CORS explicitly.
+ */
 export function middleware(request) {
-  const response = NextResponse.next();
+  const { pathname } = request.nextUrl;
 
-  // Apply CORS headers
-  response.headers.set("Access-Control-Allow-Origin", "*");
-  response.headers.set(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS"
-  );
-  response.headers.set(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization"
-  );
-
-  // Handle preflight
-  if (request.method === "OPTIONS") {
-    return new NextResponse(null, {
-      status: 204,
-      headers: response.headers,
-    });
+  // ✅ Allow all API routes to pass through untouched
+  if (pathname.startsWith("/api")) {
+    return NextResponse.next();
   }
 
-  return response;
+  // All non-API routes proceed normally
+  return NextResponse.next();
 }
 
-// Apply middleware ONLY to API routes
+/**
+ * Explicit matcher for clarity.
+ * Prevents accidental interception of static assets.
+ */
 export const config = {
-  matcher: "/api/:path*",
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico).*)",
+  ],
 };
