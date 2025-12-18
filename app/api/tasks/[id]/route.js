@@ -2,138 +2,141 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// ------------------
-// Supabase client
-// ------------------
+/* ---------------- Supabase ---------------- */
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ------------------
-// CORS helper
-// ------------------
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "PATCH, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  };
-}
-
-export async function OPTIONS() {
-  return new Response(null, {
-    status: 204,
-    headers: corsHeaders()
+/* ---------------- CORS ---------------- */
+function withCors(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "PATCH, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
   });
 }
 
-// ------------------
-// EDIT TASK METADATA (PLANNING ONLY)
-// ------------------
+export function OPTIONS() {
+  return withCors({}, 204);
+}
+
+/* ---------------- PATCH /api/tasks/[id] ---------------- */
+/**
+ * STATUS UPDATE ONLY
+ * Metadata edits are NOT allowed here
+ */
 export async function PATCH(request, { params }) {
   try {
     const { id: taskId } = await params;
-    const payload = await request.json();
+    const { status: newStatus } = await request.json();
 
-    if (!taskId) {
-      return new Response(
-        JSON.stringify({ error: "Task ID missing" }),
-        { status: 400, headers: corsHeaders() }
+    if (!taskId || !newStatus) {
+      return withCors(
+        { error: "Task ID and status are required" },
+        400
       );
     }
 
-    // ------------------
-    // Fetch task
-    // ------------------
+    const allowedStatuses = [
+      "PLANNING",
+      "COMMITTED",
+      "ON_HOLD",
+      "COMPLETED",
+      "CANCELLED",
+    ];
+
+    if (!allowedStatuses.includes(newStatus)) {
+      return withCors(
+        { error: "Invalid task status" },
+        400
+      );
+    }
+
+    /* ---------- Fetch current task ---------- */
     const { data: task, error: fetchError } = await supabase
       .from("tasks")
-      .select("status")
+      .select("status, title")
       .eq("id", taskId)
       .single();
 
     if (fetchError || !task) {
-      return new Response(
-        JSON.stringify({ error: "Task not found" }),
-        { status: 404, headers: corsHeaders() }
+      return withCors(
+        { error: "Task not found" },
+        404
       );
     }
 
-    // ------------------
-    // Enforce PLANNING-only edit
-    // ------------------
-    if (task.status !== "PLANNING") {
-      return new Response(
-        JSON.stringify({
-          error: "Task must be in PLANNING status to edit"
-        }),
-        { status: 409, headers: corsHeaders() }
-      );
-    }
+    const oldStatus = task.status;
 
-    // ------------------
-    // Ignore status if provided
-    // ------------------
-    delete payload.status;
-
-    // ------------------
-    // Allowed editable fields only
-    // ------------------
-    const allowedFields = [
-      "title",
-      "description",
-      "start_date",
-      "due_date",
-      "teams_involved",
-      "team_work",
-      "priority"
-    ];
-
-    const updateData = {};
-    for (const key of allowedFields) {
-      if (key in payload) {
-        updateData[key] = payload[key];
-      }
-    }
-
-    if (Object.keys(updateData).length === 0) {
-      return new Response(
-        JSON.stringify({ error: "No editable fields provided" }),
-        { status: 400, headers: corsHeaders() }
-      );
-    }
-
-    // ------------------
-    // Update task
-    // ------------------
-    const { data: updated, error: updateError } = await supabase
+    /* ---------- Update task status ---------- */
+    const { error: updateError } = await supabase
       .from("tasks")
-      .update(updateData)
-      .eq("id", taskId)
-      .select()
-      .single();
+      .update({ status: newStatus })
+      .eq("id", taskId);
 
     if (updateError) {
-      console.error("Task update error:", updateError);
-      return new Response(
-        JSON.stringify({ error: updateError.message }),
-        { status: 500, headers: corsHeaders() }
+      return withCors(
+        { error: updateError.message },
+        500
       );
     }
 
-    return new Response(
-      JSON.stringify({
-        success: true,
-        task: updated
-      }),
-      { status: 200, headers: corsHeaders() }
-    );
+    /* ---------- Assignment side-effects ---------- */
+
+    // 🔁 Move back to planning or on-hold
+    if (newStatus === "PLANNING" || newStatus === "ON_HOLD") {
+      await supabase
+        .from("assignments")
+        .update({ status: "on_hold" })
+        .eq("task_id", taskId)
+        .neq("status", "completed");
+    }
+
+    // ▶ Commit
+    if (newStatus === "COMMITTED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "committed" })
+        .eq("task_id", taskId)
+        .in("status", ["on_hold"]);
+    }
+
+    // ✅ Complete
+    if (newStatus === "COMPLETED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "completed" })
+        .eq("task_id", taskId);
+    }
+
+    // ❌ Cancel
+    if (newStatus === "CANCELLED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "inactive" })
+        .eq("task_id", taskId);
+    }
+
+    return withCors({
+      success: true,
+      task: {
+        task_id: taskId,
+        title: task.title,
+        old_status: oldStatus,
+        new_status: newStatus,
+      },
+    });
 
   } catch (err) {
-    console.error("Task edit crash:", err);
-    return new Response(
-      JSON.stringify({ error: "Internal server error" }),
-      { status: 500, headers: corsHeaders() }
+    console.error("Task status update error:", err);
+    return withCors(
+      { error: "Internal server error" },
+      500
     );
   }
 }

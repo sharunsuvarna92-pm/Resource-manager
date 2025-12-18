@@ -2,157 +2,138 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
+/* ---------------- Supabase ---------------- */
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 /* ---------------- CORS ---------------- */
-
 function withCors(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "PUT, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
-    }
+      "Access-Control-Allow-Methods": "PATCH, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
   });
 }
 
-export async function OPTIONS() {
+export function OPTIONS() {
   return withCors({}, 204);
 }
 
-/* ---------------- UPDATE MODULE + OWNERS ---------------- */
-
-export async function PUT(request, { params }) {
+/* ---------------- PATCH /api/tasks/[id] ---------------- */
+/**
+ * STATUS UPDATE ONLY
+ * Metadata edits are NOT allowed here
+ */
+export async function PATCH(request, { params }) {
   try {
-    const { id: moduleId } = await params;
+    const { id: taskId } = await params;
+    const { status: newStatus } = await request.json();
 
-    if (!moduleId) {
-      return withCors({ error: "Module ID missing" }, 400);
-    }
-
-    const body = await request.json();
-    const { name, description, owners } = body;
-
-    if (!name) {
-      return withCors({ error: "Module name is required" }, 400);
-    }
-
-    if (!Array.isArray(owners) || owners.length === 0) {
+    if (!taskId || !newStatus) {
       return withCors(
-        { error: "Module owners are required" },
+        { error: "Task ID and status are required" },
         400
       );
     }
 
-    /* ---------- VALIDATE OWNERSHIP ---------- */
+    const allowedStatuses = [
+      "PLANNING",
+      "COMMITTED",
+      "ON_HOLD",
+      "COMPLETED",
+      "CANCELLED",
+    ];
 
-    const ownershipByTeam = {};
-
-    for (const o of owners) {
-      if (!o.team_id || !o.member_id || !o.role) {
-        return withCors(
-          { error: "Each owner must have team_id, member_id, role" },
-          400
-        );
-      }
-
-      if (!["PRIMARY", "SECONDARY"].includes(o.role)) {
-        return withCors(
-          { error: "Invalid owner role" },
-          400
-        );
-      }
-
-      ownershipByTeam[o.team_id] ??= { primary: 0 };
-
-      if (o.role === "PRIMARY") {
-        ownershipByTeam[o.team_id].primary++;
-      }
-    }
-
-    const invalidTeams = Object.entries(ownershipByTeam)
-      .filter(([_, v]) => v.primary !== 1)
-      .map(([teamId]) => teamId);
-
-    if (invalidTeams.length > 0) {
+    if (!allowedStatuses.includes(newStatus)) {
       return withCors(
-        {
-          error: "Each team must have exactly one PRIMARY owner",
-          teams: invalidTeams
-        },
+        { error: "Invalid task status" },
         400
       );
     }
 
-    /* ---------- UPDATE MODULE ---------- */
-
-    const { error: moduleError } = await supabase
-      .from("modules")
-      .update({ name, description })
-      .eq("id", moduleId);
-
-    if (moduleError) {
-      return withCors({ error: moduleError.message }, 500);
-    }
-
-    /* ---------- REPLACE OWNERS (ATOMIC INTENT) ---------- */
-
-    const { error: deleteError } = await supabase
-      .from("module_owners")
-      .delete()
-      .eq("module_id", moduleId);
-
-    if (deleteError) {
-      return withCors({ error: deleteError.message }, 500);
-    }
-
-    const ownerRows = owners.map(o => ({
-      module_id: moduleId,
-      team_id: o.team_id,
-      member_id: o.member_id,
-      role: o.role
-    }));
-
-    const { error: insertError } = await supabase
-      .from("module_owners")
-      .insert(ownerRows);
-
-    if (insertError) {
-      return withCors({ error: insertError.message }, 500);
-    }
-
-    /* ---------- RETURN UPDATED MODULE ---------- */
-
-    const { data: updated } = await supabase
-      .from("modules")
-      .select(`
-        id,
-        name,
-        description,
-        module_owners (
-          team_id,
-          member_id,
-          role
-        )
-      `)
-      .eq("id", moduleId)
+    /* ---------- Fetch current task ---------- */
+    const { data: task, error: fetchError } = await supabase
+      .from("tasks")
+      .select("status, title")
+      .eq("id", taskId)
       .single();
 
-    return withCors(
-      {
-        success: true,
-        module: updated
+    if (fetchError || !task) {
+      return withCors(
+        { error: "Task not found" },
+        404
+      );
+    }
+
+    const oldStatus = task.status;
+
+    /* ---------- Update task status ---------- */
+    const { error: updateError } = await supabase
+      .from("tasks")
+      .update({ status: newStatus })
+      .eq("id", taskId);
+
+    if (updateError) {
+      return withCors(
+        { error: updateError.message },
+        500
+      );
+    }
+
+    /* ---------- Assignment side-effects ---------- */
+
+    // 🔁 Move back to planning or on-hold
+    if (newStatus === "PLANNING" || newStatus === "ON_HOLD") {
+      await supabase
+        .from("assignments")
+        .update({ status: "on_hold" })
+        .eq("task_id", taskId)
+        .neq("status", "completed");
+    }
+
+    // ▶ Commit
+    if (newStatus === "COMMITTED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "committed" })
+        .eq("task_id", taskId)
+        .in("status", ["on_hold"]);
+    }
+
+    // ✅ Complete
+    if (newStatus === "COMPLETED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "completed" })
+        .eq("task_id", taskId);
+    }
+
+    // ❌ Cancel
+    if (newStatus === "CANCELLED") {
+      await supabase
+        .from("assignments")
+        .update({ status: "inactive" })
+        .eq("task_id", taskId);
+    }
+
+    return withCors({
+      success: true,
+      task: {
+        task_id: taskId,
+        title: task.title,
+        old_status: oldStatus,
+        new_status: newStatus,
       },
-      200
-    );
+    });
 
   } catch (err) {
-    console.error("Module update crash:", err);
+    console.error("Task status update error:", err);
     return withCors(
       { error: "Internal server error" },
       500
