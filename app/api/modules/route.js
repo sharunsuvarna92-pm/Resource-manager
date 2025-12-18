@@ -26,62 +26,76 @@ const supabase = createClient(
  * {
  *   "name": "Authentication",
  *   "description": "Login & signup",
- *   "primary_roles_map": {
- *     "Backend": "PRIMARY_MEMBER_UUID"
- *   },
- *   "secondary_roles_map": {
- *     "Backend": ["SECONDARY_MEMBER_UUID"]
- *   }
+ *   "owners": [
+ *     {
+ *       "team_id": "TEAM_UUID",
+ *       "member_id": "MEMBER_UUID",
+ *       "role": "PRIMARY"
+ *     },
+ *     {
+ *       "team_id": "TEAM_UUID",
+ *       "member_id": "MEMBER_UUID",
+ *       "role": "SECONDARY"
+ *     }
+ *   ]
  * }
  */
 export async function POST(request) {
   try {
     const body = await request.json();
+    const { name, description, owners } = body;
 
-    const {
-      name,
-      description,
-      primary_roles_map,
-      secondary_roles_map
-    } = body;
-
-    if (!name) {
+    if (!name || !Array.isArray(owners) || owners.length === 0) {
       return NextResponse.json(
-        { error: "Module name is required" },
+        { error: "Module name and owners are required" },
         { status: 400, headers: corsHeaders() }
       );
     }
 
-    const { data, error } = await supabase
+    // ------------------
+    // Create module
+    // ------------------
+    const { data: module, error: moduleError } = await supabase
       .from("modules")
-      .insert([
-        {
-          name,
-          description,
-          primary_roles_map: primary_roles_map ?? {},
-          secondary_roles_map: secondary_roles_map ?? {}
-        }
-      ])
+      .insert({ name, description })
       .select()
       .single();
 
-    if (error) {
-      console.error("SUPABASE MODULE INSERT ERROR:", error);
+    if (moduleError) {
       return NextResponse.json(
-        { error: error.message },
+        { error: moduleError.message },
+        { status: 500, headers: corsHeaders() }
+      );
+    }
+
+    // ------------------
+    // Insert owners
+    // ------------------
+    const ownerRows = owners.map(o => ({
+      module_id: module.id,
+      team_id: o.team_id,
+      member_id: o.member_id,
+      role: o.role
+    }));
+
+    const { error: ownerError } = await supabase
+      .from("module_owners")
+      .insert(ownerRows);
+
+    if (ownerError) {
+      return NextResponse.json(
+        { error: ownerError.message },
         { status: 500, headers: corsHeaders() }
       );
     }
 
     return NextResponse.json(
-      {
-        message: "Module created successfully",
-        module: data
-      },
+      { success: true, module },
       { status: 201, headers: corsHeaders() }
     );
+
   } catch (err) {
-    console.error("POST /api/modules ERROR:", err);
+    console.error("Module create error:", err);
     return NextResponse.json(
       { error: "Invalid request body" },
       { status: 400, headers: corsHeaders() }
@@ -91,29 +105,20 @@ export async function POST(request) {
 
 /* ------------- GET /api/modules ------- */
 export async function GET() {
-  try {
-    const { data, error } = await supabase
-      .from("modules")
-      .select(
-        "id, name, description, primary_roles_map, secondary_roles_map"
-      )
-      .order("name");
+  const { data, error } = await supabase
+    .from("modules")
+    .select("id, name, description")
+    .order("name");
 
-    if (error) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: 500, headers: corsHeaders() }
-      );
-    }
-
+  if (error) {
     return NextResponse.json(
-      { modules: data },
-      { status: 200, headers: corsHeaders() }
-    );
-  } catch {
-    return NextResponse.json(
-      { error: "Failed to fetch modules" },
+      { error: error.message },
       { status: 500, headers: corsHeaders() }
     );
   }
+
+  return NextResponse.json(
+    { modules: data },
+    { status: 200, headers: corsHeaders() }
+  );
 }

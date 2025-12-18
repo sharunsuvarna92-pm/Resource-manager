@@ -2,63 +2,20 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// ------------------
-// Supabase client
-// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ------------------
-// UPDATE MODULE
-// ------------------
 export async function PUT(request, { params }) {
   try {
-    // ✅ App Router params must be awaited
-    const { id } = await params;
-
-    console.log("MODULE UPDATE ID:", id);
-
-    if (!id) {
-      return new Response(
-        JSON.stringify({ error: "Module ID missing in route" }),
-        { status: 400 }
-      );
-    }
-
-    // ------------------
-    // Parse body
-    // ------------------
+    const { id: moduleId } = await params;
     const body = await request.json();
+    const { name, description, owners } = body;
 
-    const {
-      name,
-      description,
-      primary_roles_map,
-      secondary_roles_map
-    } = body;
-
-    // ------------------
-    // Validation
-    // ------------------
-    if (!name) {
+    if (!moduleId || !name || !Array.isArray(owners)) {
       return new Response(
-        JSON.stringify({ error: "Module name is required" }),
-        { status: 400 }
-      );
-    }
-
-    if (primary_roles_map && typeof primary_roles_map !== "object") {
-      return new Response(
-        JSON.stringify({ error: "primary_roles_map must be a JSON object" }),
-        { status: 400 }
-      );
-    }
-
-    if (secondary_roles_map && typeof secondary_roles_map !== "object") {
-      return new Response(
-        JSON.stringify({ error: "secondary_roles_map must be a JSON object" }),
+        JSON.stringify({ error: "Invalid module update payload" }),
         { status: 400 }
       );
     }
@@ -66,33 +23,35 @@ export async function PUT(request, { params }) {
     // ------------------
     // Update module
     // ------------------
-    const { data, error } = await supabase
+    await supabase
       .from("modules")
-      .update({
-        name,
-        description,
-        primary_roles_map,
-        secondary_roles_map
-      })
-      .eq("id", id)
-      .select()
-      .single();
+      .update({ name, description })
+      .eq("id", moduleId);
 
-    if (error) {
-      console.error("Supabase module update error:", error);
-      return new Response(
-        JSON.stringify({ error: error.message }),
-        { status: 500 }
-      );
-    }
+    // ------------------
+    // Replace ownership
+    // ------------------
+    await supabase
+      .from("module_owners")
+      .delete()
+      .eq("module_id", moduleId);
 
-    return new Response(JSON.stringify(data), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    const ownerRows = owners.map(o => ({
+      module_id: moduleId,
+      team_id: o.team_id,
+      member_id: o.member_id,
+      role: o.role
+    }));
+
+    await supabase.from("module_owners").insert(ownerRows);
+
+    return new Response(
+      JSON.stringify({ success: true }),
+      { status: 200 }
+    );
 
   } catch (err) {
-    console.error("Module update crash:", err);
+    console.error("Module update error:", err);
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
       { status: 500 }

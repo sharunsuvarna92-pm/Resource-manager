@@ -2,15 +2,21 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
+// ------------------
+// Supabase client
+// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ------------------
+// CORS helper
+// ------------------
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type"
   };
 }
@@ -23,7 +29,7 @@ export async function OPTIONS() {
 }
 
 // ------------------
-// CREATE TASK (PLANNING)
+// CREATE TASK (PLANNING ONLY)
 // ------------------
 export async function POST(request) {
   try {
@@ -36,9 +42,13 @@ export async function POST(request) {
       start_date,
       due_date,
       teams_involved,
-      team_work
+      team_work,
+      priority
     } = body;
 
+    // ------------------
+    // Validation
+    // ------------------
     if (
       !title ||
       !module_id ||
@@ -54,9 +64,10 @@ export async function POST(request) {
       );
     }
 
+    // Validate module exists
     const { data: module, error: moduleError } = await supabase
       .from("modules")
-      .select("primary_roles_map")
+      .select("id")
       .eq("id", module_id)
       .single();
 
@@ -67,6 +78,9 @@ export async function POST(request) {
       );
     }
 
+    // ------------------
+    // Insert task ONLY
+    // ------------------
     const { data: task, error: taskError } = await supabase
       .from("tasks")
       .insert({
@@ -77,52 +91,16 @@ export async function POST(request) {
         due_date,
         teams_involved,
         team_work,
+        priority: priority ?? 3,
         status: "PLANNING"
       })
       .select()
       .single();
 
     if (taskError) {
+      console.error("Task insert error:", taskError);
       return new Response(
         JSON.stringify({ error: taskError.message }),
-        { status: 500, headers: corsHeaders() }
-      );
-    }
-
-    const assignments = [];
-
-    for (const team of teams_involved) {
-      const primaryOwner = module.primary_roles_map?.[team];
-
-      if (!primaryOwner) {
-        return new Response(
-          JSON.stringify({
-            error: `Primary owner not defined for team ${team}`
-          }),
-          { status: 400, headers: corsHeaders() }
-        );
-      }
-
-      assignments.push({
-        task_id: task.id,
-        team,
-        member_id: primaryOwner,
-        start_date,
-        end_date: due_date,
-        assigned_hours: team_work[team]?.effort_hours || 0,
-        status: "draft",
-        source: "auto",
-        created_at: new Date().toISOString()
-      });
-    }
-
-    const { error: assignmentError } = await supabase
-      .from("assignments")
-      .insert(assignments);
-
-    if (assignmentError) {
-      return new Response(
-        JSON.stringify({ error: assignmentError.message }),
         { status: 500, headers: corsHeaders() }
       );
     }
@@ -162,6 +140,7 @@ export async function GET() {
         module_id,
         teams_involved,
         team_work,
+        priority,
         created_at
       `)
       .order("created_at", { ascending: false });

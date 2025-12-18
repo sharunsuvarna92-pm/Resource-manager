@@ -2,119 +2,138 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
+// ------------------
+// Supabase client
+// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // ------------------
-// UPDATE TASK STATUS
+// CORS helper
+// ------------------
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "PATCH, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  };
+}
+
+export async function OPTIONS() {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders()
+  });
+}
+
+// ------------------
+// EDIT TASK METADATA (PLANNING ONLY)
 // ------------------
 export async function PATCH(request, { params }) {
   try {
     const { id: taskId } = await params;
-    const { status: newStatus } = await request.json();
+    const payload = await request.json();
 
-    if (!taskId || !newStatus) {
+    if (!taskId) {
       return new Response(
-        JSON.stringify({ error: "Task ID and status are required" }),
-        { status: 400 }
-      );
-    }
-
-    const allowedStatuses = [
-      "PLANNING",
-      "COMMITTED",
-      "ON_HOLD",
-      "COMPLETED",
-      "CANCELLED"
-    ];
-
-    if (!allowedStatuses.includes(newStatus)) {
-      return new Response(
-        JSON.stringify({ error: "Invalid task status" }),
-        { status: 400 }
+        JSON.stringify({ error: "Task ID missing" }),
+        { status: 400, headers: corsHeaders() }
       );
     }
 
     // ------------------
     // Fetch task
     // ------------------
-    const { data: task, error } = await supabase
+    const { data: task, error: fetchError } = await supabase
       .from("tasks")
       .select("status")
       .eq("id", taskId)
       .single();
 
-    if (error || !task) {
+    if (fetchError || !task) {
       return new Response(
         JSON.stringify({ error: "Task not found" }),
-        { status: 404 }
+        { status: 404, headers: corsHeaders() }
       );
     }
 
-    const oldStatus = task.status;
+    // ------------------
+    // Enforce PLANNING-only edit
+    // ------------------
+    if (task.status !== "PLANNING") {
+      return new Response(
+        JSON.stringify({
+          error: "Task must be in PLANNING status to edit"
+        }),
+        { status: 409, headers: corsHeaders() }
+      );
+    }
 
     // ------------------
-    // Update task status
+    // Ignore status if provided
     // ------------------
-    await supabase
+    delete payload.status;
+
+    // ------------------
+    // Allowed editable fields only
+    // ------------------
+    const allowedFields = [
+      "title",
+      "description",
+      "start_date",
+      "due_date",
+      "teams_involved",
+      "team_work",
+      "priority"
+    ];
+
+    const updateData = {};
+    for (const key of allowedFields) {
+      if (key in payload) {
+        updateData[key] = payload[key];
+      }
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return new Response(
+        JSON.stringify({ error: "No editable fields provided" }),
+        { status: 400, headers: corsHeaders() }
+      );
+    }
+
+    // ------------------
+    // Update task
+    // ------------------
+    const { data: updated, error: updateError } = await supabase
       .from("tasks")
-      .update({ status: newStatus })
-      .eq("id", taskId);
+      .update(updateData)
+      .eq("id", taskId)
+      .select()
+      .single();
 
-    // ------------------
-    // Assignment side-effects
-    // ------------------
-
-    // 🔁 Back to planning OR on hold
-    if (newStatus === "PLANNING" || newStatus === "ON_HOLD") {
-      await supabase
-        .from("assignments")
-        .update({ status: "draft" })
-        .eq("task_id", taskId)
-        .neq("status", "completed");
-    }
-
-    // ▶ Commit
-    if (newStatus === "COMMITTED") {
-      await supabase
-        .from("assignments")
-        .update({ status: "committed" })
-        .eq("task_id", taskId)
-        .eq("status", "draft");
-    }
-
-    // ✅ Complete
-    if (newStatus === "COMPLETED") {
-      await supabase
-        .from("assignments")
-        .update({ status: "completed" })
-        .eq("task_id", taskId);
-    }
-
-    // ❌ Cancel
-    if (newStatus === "CANCELLED") {
-      await supabase
-        .from("assignments")
-        .delete()
-        .eq("task_id", taskId);
+    if (updateError) {
+      console.error("Task update error:", updateError);
+      return new Response(
+        JSON.stringify({ error: updateError.message }),
+        { status: 500, headers: corsHeaders() }
+      );
     }
 
     return new Response(
       JSON.stringify({
         success: true,
-        old_status: oldStatus,
-        new_status: newStatus
+        task: updated
       }),
-      { status: 200 }
+      { status: 200, headers: corsHeaders() }
     );
 
   } catch (err) {
-    console.error("Status update error:", err);
+    console.error("Task edit crash:", err);
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
-      { status: 500 }
+      { status: 500, headers: corsHeaders() }
     );
   }
 }

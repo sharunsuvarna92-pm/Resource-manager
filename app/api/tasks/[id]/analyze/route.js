@@ -106,13 +106,25 @@ export async function POST(req, { params }) {
   const taskStart = ensureWorkingTime(toIST(task.start_date));
   const dueDate = endOfWorkDayIST(task.due_date);
 
-  const { data: module } = await supabase
-    .from("modules")
-    .select("primary_roles_map, secondary_roles_map")
-    .eq("id", task.module_id)
-    .single();
+  /* ---------- OWNERS ---------- */
+  const { data: owners = [] } = await supabase
+    .from("module_owners")
+    .select("team_id, member_id, role")
+    .eq("module_id", task.module_id);
 
-  /* 🔥 FETCH COMMITTED ASSIGNMENTS WITH TASK METADATA */
+  const ownersByTeam = {};
+  for (const o of owners) {
+    if (!ownersByTeam[o.team_id]) {
+      ownersByTeam[o.team_id] = { primary: null, secondaries: [] };
+    }
+    if (o.role === "PRIMARY") {
+      ownersByTeam[o.team_id].primary = o.member_id;
+    } else {
+      ownersByTeam[o.team_id].secondaries.push(o.member_id);
+    }
+  }
+
+  /* ---------- COMMITTED CAPACITY ---------- */
   const { data: committed = [] } = await supabase
     .from("assignments")
     .select(`
@@ -125,7 +137,8 @@ export async function POST(req, { params }) {
         priority
       )
     `)
-    .eq("status", "committed");
+    .eq("status", "committed")
+    .eq("counts_toward_capacity", true);
 
   const order = topoSort(task.team_work);
 
@@ -138,6 +151,7 @@ export async function POST(req, { params }) {
 
   function buildPlan(ownerMap) {
     const timeline = {};
+    let primaryCount = 0;
 
     for (const team of order) {
       const effort = task.team_work[team].effort_hours;
@@ -155,16 +169,16 @@ export async function POST(req, { params }) {
       const start = ensureWorkingTime(maxDate([depEnd, ownerReady]));
       const end = owner ? addWorkingHours(start, effort) : start;
 
+      const isPrimary = owner === ownersByTeam[team]?.primary;
+      if (isPrimary) primaryCount++;
+
       timeline[team] = {
         assigned_to: owner,
         start_date: fromIST(start).toISOString(),
         end_date: fromIST(end).toISOString(),
         effort_hours: effort,
         depends_on: dependsOn,
-        owner_type:
-          owner === module.primary_roles_map[team]
-            ? "primary"
-            : "secondary"
+        owner_type: isPrimary ? "primary" : "secondary"
       };
     }
 
@@ -172,11 +186,10 @@ export async function POST(req, { params }) {
       Object.values(timeline).map(t => toIST(t.end_date))
     );
 
-    return { timeline, delivery };
+    return { timeline, delivery, primaryCount };
   }
 
-  /* ---------- Generate paths ---------- */
-
+  /* ---------- GENERATE PATHS ---------- */
   const teams = order;
   const paths = [];
 
@@ -187,80 +200,117 @@ export async function POST(req, { params }) {
     }
 
     const team = teams[idx];
-    const p = module.primary_roles_map?.[team];
-    const s = module.secondary_roles_map?.[team]?.[0];
+    const { primary, secondaries } = ownersByTeam[team] || {};
 
-    if (p) generate(idx + 1, { ...map, [team]: p });
-    if (s) generate(idx + 1, { ...map, [team]: s });
+    if (primary) generate(idx + 1, { ...map, [team]: primary });
+    for (const s of secondaries || []) {
+      generate(idx + 1, { ...map, [team]: s });
+    }
   }
 
   generate(0, {});
 
-  const allPrimary = paths.find(p =>
-    Object.values(p.timeline).every(t => t.owner_type === "primary")
+  /* ---------- PATH SELECTION ---------- */
+  const allPrimary = paths.find(
+    p => p.primaryCount === teams.length && p.delivery <= dueDate
   );
 
   let chosen;
   let feasible = false;
 
-  if (allPrimary && allPrimary.delivery <= dueDate) {
+  if (allPrimary) {
     chosen = allPrimary;
     feasible = true;
   } else {
-    const fitting = paths.filter(p => p.delivery <= dueDate);
-    if (fitting.length) {
-      chosen = fitting.sort((a, b) => a.delivery - b.delivery)[0];
+    const feasiblePaths = paths.filter(p => p.delivery <= dueDate);
+    if (feasiblePaths.length) {
       feasible = true;
+      chosen = feasiblePaths.sort((a, b) => {
+        if (b.primaryCount !== a.primaryCount) {
+          return b.primaryCount - a.primaryCount;
+        }
+        return a.delivery - b.delivery;
+      })[0];
     } else {
       chosen = paths.sort((a, b) => a.delivery - b.delivery)[0];
     }
   }
 
-  /* ================= BLOCKING REASON (NEW) ================= */
+  /* ================= BLOCKING EXPLANATION (STEP 4) ================= */
 
   let blocking_reason = null;
   let recommendation = null;
 
-  if (!feasible && allPrimary) {
-    const [blockingTeam, blockData] = Object.entries(allPrimary.timeline)
-      .sort((a, b) => new Date(b[1].end_date) - new Date(a[1].end_date))[0];
+  if (!feasible && chosen) {
+    // 1️⃣ Dependency-based blocking
+    for (const [team, data] of Object.entries(chosen.timeline)) {
+      for (const dep of data.depends_on || []) {
+        const depEnd = new Date(chosen.timeline[dep].end_date);
+        if (depEnd > dueDate) {
+          blocking_reason = {
+            type: "DEPENDENCY_BLOCK",
+            team,
+            depends_on: dep,
+            message:
+              `Work for team ${team} cannot start before ${depEnd.toISOString()} because it depends on ${dep}, which itself completes after the due date.`,
+            why:
+              "Dependent work starts only after prerequisite work completes, leaving no working window before the due date."
+          };
 
-    const memberId = blockData.assigned_to;
-    const conflict = committed
-      .filter(a => a.member_id === memberId)
-      .find(a => toIST(a.end_date) > taskStart);
+          recommendation = {
+            action: "ADJUST_DEPENDENCY_OR_DUE_DATE",
+            message:
+              "Consider reprioritizing or parallelizing dependent work, or extend the due date."
+          };
+          break;
+        }
+      }
+      if (blocking_reason) break;
+    }
 
-    if (conflict) {
-      blocking_reason = {
-        type: "RESOURCE_CONFLICT",
-        team: blockingTeam,
-        member_id: memberId,
-        conflicting_task: {
-          id: conflict.task_id,
-          title: conflict.tasks?.title,
-          priority: conflict.tasks?.priority
-        },
-        conflict_window: {
-          from: conflict.start_date,
-          to: conflict.end_date
-        },
-        message: `Task cannot be completed because the primary owner is already committed to a ${conflict.tasks?.priority || "higher"} priority task.`
-      };
+    // 2️⃣ Resource-based blocking
+    if (!blocking_reason) {
+      const [blockingTeam, blockData] = Object.entries(chosen.timeline)
+        .sort((a, b) => new Date(b[1].end_date) - new Date(a[1].end_date))[0];
 
-      recommendation = {
-        action: "REPRIORITIZE",
-        message:
-          "If this task has higher priority, consider reprioritizing the conflicting task or adjusting its due date."
-      };
+      const conflict = committed.find(
+        a => a.member_id === blockData.assigned_to
+      );
+
+      if (conflict) {
+        blocking_reason = {
+          type: "RESOURCE_CONFLICT",
+          team: blockingTeam,
+          member_id: blockData.assigned_to,
+          conflicting_task: {
+            id: conflict.task_id,
+            title: conflict.tasks?.title,
+            priority: conflict.tasks?.priority
+          },
+          conflict_window: {
+            from: conflict.start_date,
+            to: conflict.end_date
+          },
+          message:
+            "The assigned owner is already committed during the only remaining working window before the due date.",
+          why:
+            "This overlap eliminates all remaining working hours required to complete the task before the due date."
+        };
+
+        recommendation = {
+          action: "REPRIORITIZE_OR_DELAY",
+          message:
+            "If this task has higher priority, consider reprioritizing the conflicting task or extending the due date."
+        };
+      }
     }
   }
 
   return NextResponse.json({
     feasible,
-    blocking_team: feasible ? null : blocking_reason?.team,
+    estimated_delivery: fromIST(chosen.delivery).toISOString(),
     blocking_reason,
     recommendation,
-    estimated_delivery: fromIST(chosen.delivery).toISOString(),
     plan: chosen.timeline
   });
 }
