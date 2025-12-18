@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-/* ================= SUPABASE ================= */
+export const runtime = "nodejs";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -79,11 +79,13 @@ function topoSort(teamWork) {
   const visited = new Set();
   const order = [];
 
-  function visit(team) {
-    if (visited.has(team)) return;
-    visited.add(team);
-    for (const dep of teamWork[team].depends_on || []) visit(dep);
-    order.push(team);
+  function visit(teamId) {
+    if (visited.has(teamId)) return;
+    visited.add(teamId);
+    for (const dep of teamWork[teamId].depends_on || []) {
+      visit(dep);
+    }
+    order.push(teamId);
   }
 
   Object.keys(teamWork).forEach(visit);
@@ -96,7 +98,6 @@ export async function POST(req, { params }) {
   const { id: taskId } = await params;
 
   /* ---------- Fetch task ---------- */
-
   const { data: task } = await supabase
     .from("tasks")
     .select("*")
@@ -114,59 +115,31 @@ export async function POST(req, { params }) {
   const dueDate = endOfWorkDayIST(task.due_date);
 
   /* ---------- Fetch module owners ---------- */
-
   const { data: owners = [] } = await supabase
     .from("module_owners")
     .select("team_id, member_id, role")
     .eq("module_id", task.module_id);
 
   /* ---------- Build ownersByTeam ---------- */
-
   const ownersByTeam = {};
-
-  for (const o of owners) {
-    ownersByTeam[o.team_id] ??= {
-      primary: null,
-      secondary: []
-    };
-
-    if (o.role === "PRIMARY") {
-      ownersByTeam[o.team_id].primary = o.member_id;
+  owners.forEach(o => {
+    if (!ownersByTeam[o.team_id]) {
+      ownersByTeam[o.team_id] = { primary: null, secondary: [] };
     }
+    if (o.role === "PRIMARY") ownersByTeam[o.team_id].primary = o.member_id;
+    if (o.role === "SECONDARY") ownersByTeam[o.team_id].secondary.push(o.member_id);
+  });
 
-    if (o.role === "SECONDARY") {
-      ownersByTeam[o.team_id].secondary.push(o.member_id);
-    }
-  }
+  /* ---------- Fetch lookup tables ---------- */
+  const [{ data: teams = [] }, { data: members = [] }] = await Promise.all([
+    supabase.from("teams").select("id, name"),
+    supabase.from("team_members").select("id, name")
+  ]);
 
-  /* ---------- Ownership validation ---------- */
-
-  const missingOwnershipTeams = Object.keys(task.team_work)
-    .filter(
-      team =>
-        !ownersByTeam[team] ||
-        !ownersByTeam[team].primary
-    );
-
-  if (missingOwnershipTeams.length > 0) {
-    return NextResponse.json({
-      feasible: false,
-      blocking_reason: {
-        type: "OWNERSHIP_MISSING",
-        teams: missingOwnershipTeams,
-        message:
-          "Task cannot be analyzed because one or more teams do not have a primary owner assigned."
-      },
-      recommendation: {
-        action: "FIX_MODULE_OWNERSHIP",
-        message:
-          "Assign a primary owner for each team in the module before analyzing the task."
-      }
-    });
-  }
+  const teamNameById = Object.fromEntries(teams.map(t => [t.id, t.name]));
+  const memberNameById = Object.fromEntries(members.map(m => [m.id, m.name]));
 
   /* ---------- Fetch committed assignments ---------- */
-
   const { data: committed = [] } = await supabase
     .from("assignments")
     .select(`
@@ -181,6 +154,33 @@ export async function POST(req, { params }) {
     `)
     .eq("status", "committed");
 
+  /* ---------- Validate ownership ---------- */
+  const missingOwners = Object.keys(task.team_work)
+    .filter(teamId => !ownersByTeam[teamId]?.primary);
+
+  if (missingOwners.length > 0) {
+    return NextResponse.json({
+      feasible: false,
+      blocking_reason: {
+        type: "OWNERSHIP_MISSING",
+        teams: missingOwners.map(tid => ({
+          team_id: tid,
+          team_name: teamNameById[tid] || null
+        })),
+        message:
+          "One or more teams do not have a primary owner assigned for this module."
+      },
+      recommendation: {
+        action: "ASSIGN_PRIMARY_OWNER",
+        message:
+          "Please assign a primary owner for each team in the module before analyzing."
+      }
+    });
+  }
+
+  /* ---------- Dependency order ---------- */
+  const order = topoSort(task.team_work);
+
   function earliestAvailability(memberId) {
     const busy = committed
       .filter(a => a.member_id === memberId)
@@ -188,37 +188,41 @@ export async function POST(req, { params }) {
     return busy.length ? maxDate(busy) : taskStart;
   }
 
-  /* ---------- Build execution plan ---------- */
-
-  const order = topoSort(task.team_work);
-
   function buildPlan(ownerMap) {
     const timeline = {};
 
-    for (const team of order) {
-      const effort = task.team_work[team].effort_hours;
-      const dependsOn = task.team_work[team].depends_on || [];
-      const owner = ownerMap[team];
+    for (const teamId of order) {
+      const effort = task.team_work[teamId].effort_hours;
+      const dependsOn = task.team_work[teamId].depends_on || [];
+      const owner = ownerMap[teamId];
 
       const depEnd = dependsOn.length
         ? maxDate(dependsOn.map(d => toIST(timeline[d].end_date)))
         : taskStart;
 
-      const ownerReady = earliestAvailability(owner);
+      const ownerReady = owner
+        ? earliestAvailability(owner)
+        : depEnd;
 
       const start = ensureWorkingTime(maxDate([depEnd, ownerReady]));
-      const end = addWorkingHours(start, effort);
+      const end = owner ? addWorkingHours(start, effort) : start;
 
-      timeline[team] = {
+      timeline[teamId] = {
+        team_id: teamId,
+        team_name: teamNameById[teamId] || null,
+
         assigned_to: owner,
+        assigned_to_name: memberNameById[owner] || null,
+
         start_date: fromIST(start).toISOString(),
         end_date: fromIST(end).toISOString(),
         effort_hours: effort,
+
         depends_on: dependsOn,
+        depends_on_names: dependsOn.map(d => teamNameById[d] || null),
+
         owner_type:
-          owner === ownersByTeam[team].primary
-            ? "primary"
-            : "secondary"
+          owner === ownersByTeam[teamId].primary ? "primary" : "secondary"
       };
     }
 
@@ -229,30 +233,26 @@ export async function POST(req, { params }) {
     return { timeline, delivery };
   }
 
-  /* ---------- Generate all paths ---------- */
-
-  const teams = order;
+  /* ---------- Generate paths ---------- */
+  const teamsInOrder = order;
   const paths = [];
 
   function generate(idx, map) {
-    if (idx === teams.length) {
+    if (idx === teamsInOrder.length) {
       paths.push(buildPlan(map));
       return;
     }
 
-    const team = teams[idx];
-    const { primary, secondary } = ownersByTeam[team];
+    const teamId = teamsInOrder[idx];
+    const { primary, secondary } = ownersByTeam[teamId];
 
-    generate(idx + 1, { ...map, [team]: primary });
-
-    for (const s of secondary) {
-      generate(idx + 1, { ...map, [team]: s });
-    }
+    if (primary) generate(idx + 1, { ...map, [teamId]: primary });
+    secondary.forEach(sec =>
+      generate(idx + 1, { ...map, [teamId]: sec })
+    );
   }
 
   generate(0, {});
-
-  /* ---------- HARD GUARD: zero paths ---------- */
 
   if (paths.length === 0) {
     return NextResponse.json({
@@ -260,18 +260,17 @@ export async function POST(req, { params }) {
       blocking_reason: {
         type: "NO_EXECUTION_PATH",
         message:
-          "No valid execution path could be generated due to ownership configuration."
+          "No valid execution path could be generated with current ownership and dependencies."
       },
       recommendation: {
-        action: "REVIEW_MODULE_OWNERS",
+        action: "REVIEW_MODULE_OWNERSHIP",
         message:
-          "Ensure each team has a primary owner and optional secondary owners."
+          "Ensure all teams have valid owners and dependency cycles are resolved."
       }
     });
   }
 
-  /* ---------- Choose best path ---------- */
-
+  /* ---------- Path selection ---------- */
   const allPrimary = paths.find(p =>
     Object.values(p.timeline).every(t => t.owner_type === "primary")
   );
@@ -292,52 +291,22 @@ export async function POST(req, { params }) {
     }
   }
 
-  /* ---------- Blocking explanation ---------- */
-
-  let blocking_reason = null;
-  let recommendation = null;
-
-  if (!feasible) {
-    const [blockingTeam, blockData] = Object.entries(chosen.timeline)
-      .sort((a, b) => new Date(b[1].end_date) - new Date(a[1].end_date))[0];
-
-    const memberId = blockData.assigned_to;
-
-    const conflict = committed
-      .filter(a => a.member_id === memberId)
-      .find(a => toIST(a.end_date) > taskStart);
-
-    if (conflict) {
-      blocking_reason = {
-        type: "RESOURCE_CONFLICT",
-        team: blockingTeam,
-        member_id: memberId,
-        conflicting_task: {
-          id: conflict.task_id,
-          title: conflict.tasks?.title,
-          priority: conflict.tasks?.priority
-        },
-        conflict_window: {
-          from: conflict.start_date,
-          to: conflict.end_date
-        },
-        message:
-          "The task cannot be completed before the due date because the assigned owner is already committed to another task during the required time window."
-      };
-
-      recommendation = {
-        action: "REPRIORITIZE_OR_EXTEND",
-        message:
-          "Consider reprioritizing the conflicting task or extending this task’s due date."
-      };
-    }
-  }
-
+  /* ---------- Response ---------- */
   return NextResponse.json({
     feasible,
     estimated_delivery: fromIST(chosen.delivery).toISOString(),
-    blocking_reason,
-    recommendation,
+    blocking_reason: feasible ? null : {
+      type: "DEADLINE_EXCEEDED",
+      message:
+        "The task cannot be completed before the due date with current commitments."
+    },
+    recommendation: feasible
+      ? null
+      : {
+          action: "ADJUST_DUE_DATE_OR_REPRIORITIZE",
+          message:
+            "Consider reprioritizing conflicting work or extending the due date."
+        },
     plan: chosen.timeline
   });
 }
