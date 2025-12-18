@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
+/* ================= SUPABASE ================= */
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -67,7 +69,7 @@ const maxDate = dates =>
 
 function endOfWorkDayIST(date) {
   const d = toIST(date);
-  d.setHours(17, 0, 0, 0);
+  d.setHours(WORK_END, 0, 0, 0);
   return d;
 }
 
@@ -93,6 +95,8 @@ function topoSort(teamWork) {
 export async function POST(req, { params }) {
   const { id: taskId } = await params;
 
+  /* ---------- Fetch task ---------- */
+
   const { data: task } = await supabase
     .from("tasks")
     .select("*")
@@ -100,31 +104,69 @@ export async function POST(req, { params }) {
     .single();
 
   if (!task) {
-    return NextResponse.json({ feasible: false }, { status: 404 });
+    return NextResponse.json(
+      { feasible: false, error: "Task not found" },
+      { status: 404 }
+    );
   }
 
   const taskStart = ensureWorkingTime(toIST(task.start_date));
   const dueDate = endOfWorkDayIST(task.due_date);
 
-  /* ---------- OWNERS ---------- */
+  /* ---------- Fetch module owners ---------- */
+
   const { data: owners = [] } = await supabase
     .from("module_owners")
     .select("team_id, member_id, role")
     .eq("module_id", task.module_id);
 
+  /* ---------- Build ownersByTeam ---------- */
+
   const ownersByTeam = {};
+
   for (const o of owners) {
-    if (!ownersByTeam[o.team_id]) {
-      ownersByTeam[o.team_id] = { primary: null, secondaries: [] };
-    }
+    ownersByTeam[o.team_id] ??= {
+      primary: null,
+      secondary: []
+    };
+
     if (o.role === "PRIMARY") {
       ownersByTeam[o.team_id].primary = o.member_id;
-    } else {
-      ownersByTeam[o.team_id].secondaries.push(o.member_id);
+    }
+
+    if (o.role === "SECONDARY") {
+      ownersByTeam[o.team_id].secondary.push(o.member_id);
     }
   }
 
-  /* ---------- COMMITTED CAPACITY ---------- */
+  /* ---------- Ownership validation ---------- */
+
+  const missingOwnershipTeams = Object.keys(task.team_work)
+    .filter(
+      team =>
+        !ownersByTeam[team] ||
+        !ownersByTeam[team].primary
+    );
+
+  if (missingOwnershipTeams.length > 0) {
+    return NextResponse.json({
+      feasible: false,
+      blocking_reason: {
+        type: "OWNERSHIP_MISSING",
+        teams: missingOwnershipTeams,
+        message:
+          "Task cannot be analyzed because one or more teams do not have a primary owner assigned."
+      },
+      recommendation: {
+        action: "FIX_MODULE_OWNERSHIP",
+        message:
+          "Assign a primary owner for each team in the module before analyzing the task."
+      }
+    });
+  }
+
+  /* ---------- Fetch committed assignments ---------- */
+
   const { data: committed = [] } = await supabase
     .from("assignments")
     .select(`
@@ -137,10 +179,7 @@ export async function POST(req, { params }) {
         priority
       )
     `)
-    .eq("status", "committed")
-    .eq("counts_toward_capacity", true);
-
-  const order = topoSort(task.team_work);
+    .eq("status", "committed");
 
   function earliestAvailability(memberId) {
     const busy = committed
@@ -149,9 +188,12 @@ export async function POST(req, { params }) {
     return busy.length ? maxDate(busy) : taskStart;
   }
 
+  /* ---------- Build execution plan ---------- */
+
+  const order = topoSort(task.team_work);
+
   function buildPlan(ownerMap) {
     const timeline = {};
-    let primaryCount = 0;
 
     for (const team of order) {
       const effort = task.team_work[team].effort_hours;
@@ -162,15 +204,10 @@ export async function POST(req, { params }) {
         ? maxDate(dependsOn.map(d => toIST(timeline[d].end_date)))
         : taskStart;
 
-      const ownerReady = owner
-        ? earliestAvailability(owner)
-        : depEnd;
+      const ownerReady = earliestAvailability(owner);
 
       const start = ensureWorkingTime(maxDate([depEnd, ownerReady]));
-      const end = owner ? addWorkingHours(start, effort) : start;
-
-      const isPrimary = owner === ownersByTeam[team]?.primary;
-      if (isPrimary) primaryCount++;
+      const end = addWorkingHours(start, effort);
 
       timeline[team] = {
         assigned_to: owner,
@@ -178,7 +215,10 @@ export async function POST(req, { params }) {
         end_date: fromIST(end).toISOString(),
         effort_hours: effort,
         depends_on: dependsOn,
-        owner_type: isPrimary ? "primary" : "secondary"
+        owner_type:
+          owner === ownersByTeam[team].primary
+            ? "primary"
+            : "secondary"
       };
     }
 
@@ -186,10 +226,11 @@ export async function POST(req, { params }) {
       Object.values(timeline).map(t => toIST(t.end_date))
     );
 
-    return { timeline, delivery, primaryCount };
+    return { timeline, delivery };
   }
 
-  /* ---------- GENERATE PATHS ---------- */
+  /* ---------- Generate all paths ---------- */
+
   const teams = order;
   const paths = [];
 
@@ -200,109 +241,95 @@ export async function POST(req, { params }) {
     }
 
     const team = teams[idx];
-    const { primary, secondaries } = ownersByTeam[team] || {};
+    const { primary, secondary } = ownersByTeam[team];
 
-    if (primary) generate(idx + 1, { ...map, [team]: primary });
-    for (const s of secondaries || []) {
+    generate(idx + 1, { ...map, [team]: primary });
+
+    for (const s of secondary) {
       generate(idx + 1, { ...map, [team]: s });
     }
   }
 
   generate(0, {});
 
-  /* ---------- PATH SELECTION ---------- */
-  const allPrimary = paths.find(
-    p => p.primaryCount === teams.length && p.delivery <= dueDate
+  /* ---------- HARD GUARD: zero paths ---------- */
+
+  if (paths.length === 0) {
+    return NextResponse.json({
+      feasible: false,
+      blocking_reason: {
+        type: "NO_EXECUTION_PATH",
+        message:
+          "No valid execution path could be generated due to ownership configuration."
+      },
+      recommendation: {
+        action: "REVIEW_MODULE_OWNERS",
+        message:
+          "Ensure each team has a primary owner and optional secondary owners."
+      }
+    });
+  }
+
+  /* ---------- Choose best path ---------- */
+
+  const allPrimary = paths.find(p =>
+    Object.values(p.timeline).every(t => t.owner_type === "primary")
   );
 
   let chosen;
   let feasible = false;
 
-  if (allPrimary) {
+  if (allPrimary && allPrimary.delivery <= dueDate) {
     chosen = allPrimary;
     feasible = true;
   } else {
-    const feasiblePaths = paths.filter(p => p.delivery <= dueDate);
-    if (feasiblePaths.length) {
+    const fitting = paths.filter(p => p.delivery <= dueDate);
+    if (fitting.length) {
+      chosen = fitting.sort((a, b) => a.delivery - b.delivery)[0];
       feasible = true;
-      chosen = feasiblePaths.sort((a, b) => {
-        if (b.primaryCount !== a.primaryCount) {
-          return b.primaryCount - a.primaryCount;
-        }
-        return a.delivery - b.delivery;
-      })[0];
     } else {
       chosen = paths.sort((a, b) => a.delivery - b.delivery)[0];
     }
   }
 
-  /* ================= BLOCKING EXPLANATION (STEP 4) ================= */
+  /* ---------- Blocking explanation ---------- */
 
   let blocking_reason = null;
   let recommendation = null;
 
-  if (!feasible && chosen) {
-    // 1️⃣ Dependency-based blocking
-    for (const [team, data] of Object.entries(chosen.timeline)) {
-      for (const dep of data.depends_on || []) {
-        const depEnd = new Date(chosen.timeline[dep].end_date);
-        if (depEnd > dueDate) {
-          blocking_reason = {
-            type: "DEPENDENCY_BLOCK",
-            team,
-            depends_on: dep,
-            message:
-              `Work for team ${team} cannot start before ${depEnd.toISOString()} because it depends on ${dep}, which itself completes after the due date.`,
-            why:
-              "Dependent work starts only after prerequisite work completes, leaving no working window before the due date."
-          };
+  if (!feasible) {
+    const [blockingTeam, blockData] = Object.entries(chosen.timeline)
+      .sort((a, b) => new Date(b[1].end_date) - new Date(a[1].end_date))[0];
 
-          recommendation = {
-            action: "ADJUST_DEPENDENCY_OR_DUE_DATE",
-            message:
-              "Consider reprioritizing or parallelizing dependent work, or extend the due date."
-          };
-          break;
-        }
-      }
-      if (blocking_reason) break;
-    }
+    const memberId = blockData.assigned_to;
 
-    // 2️⃣ Resource-based blocking
-    if (!blocking_reason) {
-      const [blockingTeam, blockData] = Object.entries(chosen.timeline)
-        .sort((a, b) => new Date(b[1].end_date) - new Date(a[1].end_date))[0];
+    const conflict = committed
+      .filter(a => a.member_id === memberId)
+      .find(a => toIST(a.end_date) > taskStart);
 
-      const conflict = committed.find(
-        a => a.member_id === blockData.assigned_to
-      );
+    if (conflict) {
+      blocking_reason = {
+        type: "RESOURCE_CONFLICT",
+        team: blockingTeam,
+        member_id: memberId,
+        conflicting_task: {
+          id: conflict.task_id,
+          title: conflict.tasks?.title,
+          priority: conflict.tasks?.priority
+        },
+        conflict_window: {
+          from: conflict.start_date,
+          to: conflict.end_date
+        },
+        message:
+          "The task cannot be completed before the due date because the assigned owner is already committed to another task during the required time window."
+      };
 
-      if (conflict) {
-        blocking_reason = {
-          type: "RESOURCE_CONFLICT",
-          team: blockingTeam,
-          member_id: blockData.assigned_to,
-          conflicting_task: {
-            id: conflict.task_id,
-            title: conflict.tasks?.title,
-            priority: conflict.tasks?.priority
-          },
-          conflict_window: {
-            from: conflict.start_date,
-            to: conflict.end_date
-          },
-          message:
-            "The assigned owner is already committed during the only remaining working window before the due date.",
-          why:
-            "This overlap eliminates all remaining working hours required to complete the task before the due date."
-        };
-
-        recommendation = {
-          action: "REPRIORITIZE_OR_DELAY",
-          message:
-            "If this task has higher priority, consider reprioritizing the conflicting task or extending the due date."
-        };
-      }
+      recommendation = {
+        action: "REPRIORITIZE_OR_EXTEND",
+        message:
+          "Consider reprioritizing the conflicting task or extending this task’s due date."
+      };
     }
   }
 
