@@ -22,80 +22,46 @@ const supabase = createClient(
 
 /* ------------- POST /api/modules ------ */
 /**
- * Expected body:
- * {
- *   "name": "Authentication",
- *   "description": "Login & signup",
- *   "owners": [
- *     {
- *       "team_id": "TEAM_UUID",
- *       "member_id": "MEMBER_UUID",
- *       "role": "PRIMARY"
- *     },
- *     {
- *       "team_id": "TEAM_UUID",
- *       "member_id": "MEMBER_UUID",
- *       "role": "SECONDARY"
- *     }
- *   ]
- * }
+ * NOTE:
+ * This endpoint ONLY creates module metadata.
+ * Owners are handled separately (or by update endpoint).
  */
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { name, description, owners } = body;
 
-    if (!name || !Array.isArray(owners) || owners.length === 0) {
+    const { name, description } = body;
+
+    if (!name) {
       return NextResponse.json(
-        { error: "Module name and owners are required" },
+        { error: "Module name is required" },
         { status: 400, headers: corsHeaders() }
       );
     }
 
-    // ------------------
-    // Create module
-    // ------------------
-    const { data: module, error: moduleError } = await supabase
+    const { data, error } = await supabase
       .from("modules")
-      .insert({ name, description })
+      .insert([{ name, description }])
       .select()
       .single();
 
-    if (moduleError) {
+    if (error) {
+      console.error("SUPABASE MODULE INSERT ERROR:", error);
       return NextResponse.json(
-        { error: moduleError.message },
-        { status: 500, headers: corsHeaders() }
-      );
-    }
-
-    // ------------------
-    // Insert owners
-    // ------------------
-    const ownerRows = owners.map(o => ({
-      module_id: module.id,
-      team_id: o.team_id,
-      member_id: o.member_id,
-      role: o.role
-    }));
-
-    const { error: ownerError } = await supabase
-      .from("module_owners")
-      .insert(ownerRows);
-
-    if (ownerError) {
-      return NextResponse.json(
-        { error: ownerError.message },
+        { error: error.message },
         { status: 500, headers: corsHeaders() }
       );
     }
 
     return NextResponse.json(
-      { success: true, module },
+      {
+        message: "Module created successfully",
+        module: data
+      },
       { status: 201, headers: corsHeaders() }
     );
-
   } catch (err) {
-    console.error("Module create error:", err);
+    console.error("POST /api/modules ERROR:", err);
     return NextResponse.json(
       { error: "Invalid request body" },
       { status: 400, headers: corsHeaders() }
@@ -104,21 +70,44 @@ export async function POST(request) {
 }
 
 /* ------------- GET /api/modules ------- */
+/**
+ * Returns modules WITH embedded owners
+ * Owners are read-only here (source of truth = module_owners table)
+ */
 export async function GET() {
-  const { data, error } = await supabase
-    .from("modules")
-    .select("id, name, description")
-    .order("name");
+  try {
+    const { data, error } = await supabase
+      .from("modules")
+      .select(`
+        id,
+        name,
+        description,
+        module_owners (
+          id,
+          team_id,
+          member_id,
+          role
+        )
+      `)
+      .order("name", { ascending: true });
 
-  if (error) {
+    if (error) {
+      console.error("SUPABASE MODULE FETCH ERROR:", error);
+      return NextResponse.json(
+        { error: error.message },
+        { status: 500, headers: corsHeaders() }
+      );
+    }
+
     return NextResponse.json(
-      { error: error.message },
+      { modules: data },
+      { status: 200, headers: corsHeaders() }
+    );
+  } catch (err) {
+    console.error("GET /api/modules ERROR:", err);
+    return NextResponse.json(
+      { error: "Failed to fetch modules" },
       { status: 500, headers: corsHeaders() }
     );
   }
-
-  return NextResponse.json(
-    { modules: data },
-    { status: 200, headers: corsHeaders() }
-  );
 }
