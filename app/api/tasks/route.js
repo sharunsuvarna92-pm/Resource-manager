@@ -2,13 +2,25 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// ------------------
-// Supabase client
-// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  };
+}
+
+export async function OPTIONS() {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders()
+  });
+}
 
 // ------------------
 // CREATE TASK (PLANNING)
@@ -27,9 +39,6 @@ export async function POST(request) {
       team_work
     } = body;
 
-    // ------------------
-    // Validation
-    // ------------------
     if (
       !title ||
       !module_id ||
@@ -41,13 +50,10 @@ export async function POST(request) {
     ) {
       return new Response(
         JSON.stringify({ error: "Missing required task fields" }),
-        { status: 400 }
+        { status: 400, headers: corsHeaders() }
       );
     }
 
-    // ------------------
-    // Fetch module owners
-    // ------------------
     const { data: module, error: moduleError } = await supabase
       .from("modules")
       .select("primary_roles_map")
@@ -57,13 +63,10 @@ export async function POST(request) {
     if (moduleError || !module) {
       return new Response(
         JSON.stringify({ error: "Invalid module_id" }),
-        { status: 400 }
+        { status: 400, headers: corsHeaders() }
       );
     }
 
-    // ------------------
-    // Create task
-    // ------------------
     const { data: task, error: taskError } = await supabase
       .from("tasks")
       .insert({
@@ -80,16 +83,12 @@ export async function POST(request) {
       .single();
 
     if (taskError) {
-      console.error("Task create error:", taskError);
       return new Response(
         JSON.stringify({ error: taskError.message }),
-        { status: 500 }
+        { status: 500, headers: corsHeaders() }
       );
     }
 
-    // ------------------
-    // Create draft assignments
-    // ------------------
     const assignments = [];
 
     for (const team of teams_involved) {
@@ -98,9 +97,9 @@ export async function POST(request) {
       if (!primaryOwner) {
         return new Response(
           JSON.stringify({
-            error: `Primary owner not defined for team ${team} in module`
+            error: `Primary owner not defined for team ${team}`
           }),
-          { status: 400 }
+          { status: 400, headers: corsHeaders() }
         );
       }
 
@@ -122,10 +121,9 @@ export async function POST(request) {
       .insert(assignments);
 
     if (assignmentError) {
-      console.error("Assignment create error:", assignmentError);
       return new Response(
         JSON.stringify({ error: assignmentError.message }),
-        { status: 500 }
+        { status: 500, headers: corsHeaders() }
       );
     }
 
@@ -135,21 +133,21 @@ export async function POST(request) {
         task_id: task.id,
         status: task.status
       }),
-      {
-        status: 201,
-        headers: { "Content-Type": "application/json" }
-      }
+      { status: 201, headers: corsHeaders() }
     );
 
   } catch (err) {
     console.error("Create task crash:", err);
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
-      { status: 500 }
+      { status: 500, headers: corsHeaders() }
     );
   }
 }
 
+// ------------------
+// LIST TASKS
+// ------------------
 export async function GET() {
   try {
     const { data, error } = await supabase
@@ -171,19 +169,19 @@ export async function GET() {
     if (error) {
       return new Response(
         JSON.stringify({ error: error.message }),
-        { status: 500 }
+        { status: 500, headers: corsHeaders() }
       );
     }
 
-    return new Response(JSON.stringify(data), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return new Response(
+      JSON.stringify(data),
+      { status: 200, headers: corsHeaders() }
+    );
 
   } catch (err) {
     return new Response(
       JSON.stringify({ error: "Failed to fetch tasks" }),
-      { status: 500 }
+      { status: 500, headers: corsHeaders() }
     );
   }
 }
