@@ -8,13 +8,22 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ---------------- CORS (FINAL) ---------------- */
-function withCors(body, status = 200) {
+/* ---------------- CORS (CREDENTIAL SAFE) ---------------- */
+/**
+ * IMPORTANT:
+ * - Frontend sends cookies / credentials
+ * - Therefore Access-Control-Allow-Origin CANNOT be "*"
+ * - We MUST echo request origin
+ */
+function withCors(request, body, status = 200) {
+  const origin = request.headers.get("origin");
+
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": origin ?? "",
+      "Access-Control-Allow-Credentials": "true",
       "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
       "Access-Control-Allow-Headers":
         "Content-Type, Authorization, Accept",
@@ -22,9 +31,9 @@ function withCors(body, status = 200) {
   });
 }
 
-export function OPTIONS() {
-  // Preflight must succeed with correct headers
-  return withCors({}, 204);
+export function OPTIONS(request) {
+  // Preflight must return the same CORS headers
+  return withCors(request, {}, 204);
 }
 
 /* ---------------- PUT /api/modules/[id] ---------------- */
@@ -41,6 +50,7 @@ export async function PUT(request, { params }) {
 
     if (!moduleId) {
       return withCors(
+        request,
         { error: "Module ID missing in route" },
         400
       );
@@ -51,6 +61,7 @@ export async function PUT(request, { params }) {
 
     if (!name) {
       return withCors(
+        request,
         { error: "Module name is required" },
         400
       );
@@ -58,6 +69,7 @@ export async function PUT(request, { params }) {
 
     if (!Array.isArray(owners)) {
       return withCors(
+        request,
         { error: "owners must be an array" },
         400
       );
@@ -77,6 +89,7 @@ export async function PUT(request, { params }) {
 
     if (moduleError) {
       return withCors(
+        request,
         { error: moduleError.message },
         500
       );
@@ -106,6 +119,7 @@ export async function PUT(request, { params }) {
 
       if (ownerError) {
         return withCors(
+          request,
           { error: ownerError.message },
           500
         );
@@ -122,7 +136,7 @@ export async function PUT(request, { params }) {
       `)
       .eq("module_id", moduleId);
 
-    return withCors({
+    return withCors(request, {
       success: true,
       module: {
         module_id: module.id,
@@ -145,6 +159,7 @@ export async function PUT(request, { params }) {
   } catch (err) {
     console.error("Module update error:", err);
     return withCors(
+      request,
       { error: "Internal server error" },
       500
     );
