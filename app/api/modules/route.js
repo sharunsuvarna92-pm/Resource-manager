@@ -32,6 +32,7 @@ export async function OPTIONS(request) {
 /* ================= POST /api/modules ================= */
 export async function POST(request) {
   let body;
+
   try {
     body = await request.json();
   } catch {
@@ -50,7 +51,7 @@ export async function POST(request) {
     );
   }
 
-  /* ---------- Create module ---------- */
+  /* ---------- 1. CREATE MODULE ---------- */
   const { data: module, error: moduleError } = await supabase
     .from("modules")
     .insert({
@@ -63,37 +64,52 @@ export async function POST(request) {
 
   if (moduleError || !module) {
     return NextResponse.json(
-      { error: moduleError?.message || "Module creation failed" },
+      {
+        error: "Module creation failed",
+        details: moduleError,
+      },
       { status: 500, headers: corsHeaders(request) }
     );
   }
 
-  /* ---------- Insert owners ---------- */
+  /* ---------- 2. CREATE MODULE OWNERS ---------- */
+  let ownersInserted = [];
+
   if (Array.isArray(module_owners) && module_owners.length > 0) {
     const rows = module_owners.map(o => ({
       module_id: module.id,
       team_id: o.team_id,
       member_id: o.member_id,
-      role: o.role, // PRIMARY | SECONDARY
+      role: o.role,
       created_at: new Date().toISOString(),
     }));
 
-    const { error: ownersError } = await supabase
+    const { data, error } = await supabase
       .from("module_owners")
-      .insert(rows);
+      .insert(rows)
+      .select(); // 🔥 IMPORTANT
 
-    if (ownersError) {
+    if (error) {
       return NextResponse.json(
-        { error: ownersError.message },
+        {
+          error: "Module created but owners insert failed",
+          supabase_error: error,
+          attempted_rows: rows,
+        },
         { status: 500, headers: corsHeaders(request) }
       );
     }
+
+    ownersInserted = data;
   }
 
+  /* ---------- 3. RESPONSE ---------- */
   return NextResponse.json(
     {
       success: true,
       module_id: module.id,
+      owners_created: ownersInserted.length,
+      owners: ownersInserted,
     },
     { status: 201, headers: corsHeaders(request) }
   );
@@ -103,12 +119,7 @@ export async function POST(request) {
 export async function GET(request) {
   const { data, error } = await supabase
     .from("modules")
-    .select(`
-      id,
-      name,
-      description,
-      created_at
-    `)
+    .select("id, name, description, created_at")
     .order("name");
 
   if (error) {
