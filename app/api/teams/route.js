@@ -6,11 +6,15 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// CREATE TEAM
 export async function POST(request) {
   const { name, description } = await request.json();
 
-  if (!name?.trim()) {
-    return NextResponse.json({ error: "Team name required" }, { status: 400 });
+  if (!name) {
+    return NextResponse.json(
+      { error: "Team name required" },
+      { status: 400 }
+    );
   }
 
   const { data, error } = await supabase
@@ -26,6 +30,7 @@ export async function POST(request) {
   return NextResponse.json({ team: data }, { status: 201 });
 }
 
+// LIST TEAMS
 export async function GET() {
   const { data, error } = await supabase
     .from("teams")
@@ -38,3 +43,8 @@ export async function GET() {
 
   return NextResponse.json({ teams: data });
 }
+
+/*
+🚫 ABSOLUTELY NO PUT
+🚫 ABSOLUTELY NO PATCH
+*/
