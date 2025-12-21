@@ -7,30 +7,15 @@ const supabase = createClient(
 );
 
 /**
- * CREATE MODULE
- * POST /api/modules
+ * GET /api/modules
+ * Returns modules with ownership details (primary + secondary)
  */
-export async function POST(request) {
-  const body = await request.json();
-  const { name, description, module_owners } = body;
-
-  if (!name) {
-    return NextResponse.json(
-      { error: "Module name is required" },
-      { status: 400 }
-    );
-  }
-
-  // 1️⃣ Create module
-  const { data: module, error: moduleError } = await supabase
+export async function GET() {
+  // 1️⃣ Fetch modules
+  const { data: modules, error: moduleError } = await supabase
     .from("modules")
-    .insert({
-      name,
-      description,
-      created_at: new Date().toISOString()
-    })
-    .select()
-    .single();
+    .select("id, name, description, created_at")
+    .order("name");
 
   if (moduleError) {
     return NextResponse.json(
@@ -39,53 +24,58 @@ export async function POST(request) {
     );
   }
 
-  // 2️⃣ Insert owners (optional)
-  if (Array.isArray(module_owners) && module_owners.length > 0) {
-    const rows = module_owners.map(o => ({
-      module_id: module.id,
-      team_id: o.team_id,
-      member_id: o.member_id,
-      role: o.role,
-      created_at: new Date().toISOString()
-    }));
-
-    const { error: ownerError } = await supabase
-      .from("module_owners")
-      .insert(rows);
-
-    if (ownerError) {
-      return NextResponse.json(
-        {
-          error: "Module created but owner assignment failed",
-          details: ownerError.message
-        },
-        { status: 500 }
-      );
-    }
+  if (!modules || modules.length === 0) {
+    return NextResponse.json({ modules: [] });
   }
 
-  return NextResponse.json(
-    { module },
-    { status: 201 }
-  );
-}
+  const moduleIds = modules.map(m => m.id);
 
-/**
- * LIST MODULES
- * GET /api/modules
- */
-export async function GET() {
-  const { data, error } = await supabase
-    .from("modules")
-    .select("id, name, description, created_at")
-    .order("name");
+  // 2️⃣ Fetch ownerships with joins
+  const { data: owners, error: ownerError } = await supabase
+    .from("module_owners")
+    .select(`
+      module_id,
+      role,
+      teams (
+        id,
+        name
+      ),
+      team_members (
+        id,
+        name
+      )
+    `)
+    .in("module_id", moduleIds);
 
-  if (error) {
+  if (ownerError) {
     return NextResponse.json(
-      { error: error.message },
+      { error: ownerError.message },
       { status: 500 }
     );
   }
 
-  return NextResponse.json({ modules: data });
+  // 3️⃣ Group owners by module
+  const ownersByModule = {};
+
+  owners.forEach(o => {
+    if (!ownersByModule[o.module_id]) {
+      ownersByModule[o.module_id] = [];
+    }
+
+    ownersByModule[o.module_id].push({
+      team_id: o.teams?.id ?? null,
+      team_name: o.teams?.name ?? null,
+      member_id: o.team_members?.id ?? null,
+      member_name: o.team_members?.name ?? null,
+      role: o.role
+    });
+  });
+
+  // 4️⃣ Attach owners to modules
+  const enriched = modules.map(m => ({
+    ...m,
+    owners: ownersByModule[m.id] ?? []
+  }));
+
+  return NextResponse.json({ modules: enriched });
 }
