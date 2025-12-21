@@ -5,42 +5,52 @@ const ALLOWED_ORIGINS = [
   "https://resource-manager-zeta.vercel.app",
 ];
 
-function corsHeaders(origin) {
-  return {
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Credentials": "true",
-  };
+function setCorsHeaders(response, origin) {
+  response.headers.set("Access-Control-Allow-Origin", origin);
+  response.headers.set(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+  );
+  response.headers.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
+  response.headers.set("Access-Control-Allow-Credentials", "true");
 }
 
 export function middleware(request) {
-  const origin = request.headers.get("origin");
   const pathname = request.nextUrl.pathname;
+  const origin = request.headers.get("origin");
 
+  // Only API routes
   if (!pathname.startsWith("/api")) {
     return NextResponse.next();
   }
 
-  const allowedOrigin = ALLOWED_ORIGINS.includes(origin)
-    ? origin
-    : ALLOWED_ORIGINS[0];
+  // ✅ SAME-ORIGIN REQUEST (no Origin header)
+  if (!origin) {
+    // Let it pass untouched — NO CORS headers
+    if (request.method === "OPTIONS") {
+      return new NextResponse(null, { status: 204 });
+    }
+    return NextResponse.next();
+  }
 
-  // Preflight
+  // ❌ Cross-origin but not allowed
+  if (!ALLOWED_ORIGINS.includes(origin)) {
+    return new NextResponse("CORS origin not allowed", { status: 403 });
+  }
+
+  // 🔁 Preflight
   if (request.method === "OPTIONS") {
     const res = new NextResponse(null, { status: 204 });
-    Object.entries(corsHeaders(allowedOrigin)).forEach(([k, v]) =>
-      res.headers.set(k, v)
-    );
+    setCorsHeaders(res, origin);
     return res;
   }
 
   // Normal request
   const res = NextResponse.next();
-  Object.entries(corsHeaders(allowedOrigin)).forEach(([k, v]) =>
-    res.headers.set(k, v)
-  );
-
+  setCorsHeaders(res, origin);
   return res;
 }
 
