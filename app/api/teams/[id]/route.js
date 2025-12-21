@@ -5,9 +5,16 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// UPDATE TEAM (AUTHORITATIVE)
-export async function PUT(request, { params }) {
-  const { id } = params ?? {};
+export async function PUT(request, ctx) {
+  // ✅ Primary: params (ideal case)
+  let id = ctx?.params?.id;
+
+  // ✅ Fallback: parse from URL (App Router edge-case fix)
+  if (!id) {
+    const url = new URL(request.url);
+    const parts = url.pathname.split("/");
+    id = parts[parts.length - 1];
+  }
 
   if (!id) {
     return new Response(
@@ -42,7 +49,6 @@ export async function PUT(request, { params }) {
   );
 }
 
-// PATCH ALIAS (OPTIONAL BUT SAFE)
 export async function PATCH(request, ctx) {
   return PUT(request, ctx);
 }
