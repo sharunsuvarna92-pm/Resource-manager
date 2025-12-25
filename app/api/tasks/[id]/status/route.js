@@ -2,39 +2,39 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-// ------------------
-// Supabase client
-// ------------------
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ------------------
-// CORS helper
-// ------------------
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "PATCH, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  };
+/* ================= ID RESOLUTION ================= */
+function resolveTaskId(request, ctx) {
+  if (ctx?.params?.id) return ctx.params.id;
+
+  // Fallback for App Router + external clients
+  const parts = new URL(request.url).pathname.split("/");
+  return parts[parts.length - 2]; // /tasks/:id/status
 }
 
-export async function OPTIONS() {
-  return new Response(null, {
-    status: 204,
-    headers: corsHeaders()
-  });
-}
-
-// ------------------
-// CHANGE TASK STATUS (LIFECYCLE + CAPACITY)
-// ------------------
-export async function PATCH(request, { params }) {
+/* ================= PATCH ================= */
+/**
+ * PATCH /api/tasks/[id]/status
+ *
+ * ✔ Status updates ONLY
+ * ✔ Applies assignment capacity side-effects
+ * ❌ Metadata edits NOT allowed
+ */
+export async function PATCH(request, ctx) {
   try {
-    const { id: taskId } = await params;
+    const taskId = resolveTaskId(request, ctx);
     const { status: newStatus } = await request.json();
+
+    if (!taskId) {
+      return new Response(
+        JSON.stringify({ error: "Task ID required" }),
+        { status: 400 }
+      );
+    }
 
     const allowedStatuses = [
       "PLANNING",
@@ -44,16 +44,14 @@ export async function PATCH(request, { params }) {
       "CANCELLED"
     ];
 
-    if (!taskId || !allowedStatuses.includes(newStatus)) {
+    if (!allowedStatuses.includes(newStatus)) {
       return new Response(
-        JSON.stringify({ error: "Invalid task status or ID" }),
-        { status: 400, headers: corsHeaders() }
+        JSON.stringify({ error: "Invalid task status" }),
+        { status: 400 }
       );
     }
 
-    // ------------------
-    // Fetch current task
-    // ------------------
+    /* ---------- Fetch current task ---------- */
     const { data: task, error: fetchError } = await supabase
       .from("tasks")
       .select("status")
@@ -63,43 +61,52 @@ export async function PATCH(request, { params }) {
     if (fetchError || !task) {
       return new Response(
         JSON.stringify({ error: "Task not found" }),
-        { status: 404, headers: corsHeaders() }
+        { status: 404 }
       );
     }
 
     const oldStatus = task.status;
 
-    // ------------------
-    // Update task status
-    // ------------------
-    await supabase
+    /* ---------- Update task status ---------- */
+    const { error: updateError } = await supabase
       .from("tasks")
       .update({ status: newStatus })
       .eq("id", taskId);
 
-    // ------------------
-    // Assignment side-effects (Option B)
-    // ------------------
+    if (updateError) {
+      return new Response(
+        JSON.stringify({ error: updateError.message }),
+        { status: 500 }
+      );
+    }
 
-    // ▶ COMMITTED → include in capacity
+    /* =====================================================
+       Assignment Side-Effects (Lifecycle Rules)
+       ===================================================== */
+
+    // ▶ COMMITTED → counts toward capacity
     if (newStatus === "COMMITTED") {
       await supabase
         .from("assignments")
-        .update({ counts_toward_capacity: true })
-        .eq("task_id", taskId)
-        .eq("status", "committed");
+        .update({
+          status: "committed",
+          counts_toward_capacity: true
+        })
+        .eq("task_id", taskId);
     }
 
-    // ⏸ ON_HOLD or ↩ PLANNING → exclude from capacity
-    if (newStatus === "ON_HOLD" || newStatus === "PLANNING") {
+    // ⏸ PLANNING or ON_HOLD → release capacity
+    if (newStatus === "PLANNING" || newStatus === "ON_HOLD") {
       await supabase
         .from("assignments")
-        .update({ counts_toward_capacity: false })
+        .update({
+          counts_toward_capacity: false
+        })
         .eq("task_id", taskId)
         .eq("status", "committed");
     }
 
-    // ✅ COMPLETED → close lifecycle
+    // ✅ COMPLETED → close assignments
     if (newStatus === "COMPLETED") {
       await supabase
         .from("assignments")
@@ -110,7 +117,7 @@ export async function PATCH(request, { params }) {
         .eq("task_id", taskId);
     }
 
-    // ❌ CANCELLED → inactive forever
+    // ❌ CANCELLED → archive assignments forever
     if (newStatus === "CANCELLED") {
       await supabase
         .from("assignments")
@@ -121,20 +128,22 @@ export async function PATCH(request, { params }) {
         .eq("task_id", taskId);
     }
 
+    /* ---------- Response ---------- */
     return new Response(
       JSON.stringify({
         success: true,
+        task_id: taskId,
         old_status: oldStatus,
         new_status: newStatus
       }),
-      { status: 200, headers: corsHeaders() }
+      { status: 200 }
     );
 
   } catch (err) {
-    console.error("Status change error:", err);
+    console.error("Task status update error:", err);
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
-      { status: 500, headers: corsHeaders() }
+      { status: 500 }
     );
   }
 }
