@@ -10,15 +10,17 @@ const supabase = createClient(
 
 /* ================= ID RESOLUTION ================= */
 /**
- * Works reliably for:
+ * Correct for:
  * /api/tasks/:id/analyze
+ *
+ * Example pathname:
+ * ["", "api", "tasks", "<TASK_ID>", "analyze"]
  */
 function resolveTaskId(request, ctx) {
   if (ctx?.params?.id) return ctx.params.id;
 
   const parts = new URL(request.url).pathname.split("/");
-  // ["", "api", "tasks", "<TASK_ID>", "analyze"]
-  return parts[parts.length - 3];
+  return parts[parts.length - 2];
 }
 
 /* ================= CONFIG ================= */
@@ -169,7 +171,7 @@ export async function POST(request, ctx) {
       ownersByTeam[o.team_id].secondary.push(o.member_id);
   });
 
-  /* ---------- Lookup tables ---------- */
+  /* ---------- Lookups ---------- */
   const [{ data: teams = [] }, { data: members = [] }] = await Promise.all([
     supabase.from("teams").select("id, name"),
     supabase.from("team_members").select("id, name")
@@ -178,7 +180,7 @@ export async function POST(request, ctx) {
   const teamNameById = Object.fromEntries(teams.map(t => [t.id, t.name]));
   const memberNameById = Object.fromEntries(members.map(m => [m.id, m.name]));
 
-  /* ---------- Fetch committed assignments ---------- */
+  /* ---------- Committed assignments ---------- */
   const { data: committed = [] } = await supabase
     .from("assignments")
     .select(`
@@ -207,13 +209,11 @@ export async function POST(request, ctx) {
           team_name: teamNameById[tid] || null
         }))
       },
-      recommendation: {
-        action: "ASSIGN_PRIMARY_OWNER"
-      }
+      recommendation: { action: "ASSIGN_PRIMARY_OWNER" }
     });
   }
 
-  /* ---------- Build execution paths ---------- */
+  /* ---------- Build plans ---------- */
   const order = topoSort(task.team_work);
 
   function earliestAvailability(memberId) {
@@ -340,9 +340,7 @@ export async function POST(request, ctx) {
 
     recommendation: feasible
       ? null
-      : {
-          action: "REPRIORITIZE_OR_EXTEND_DUE_DATE"
-        },
+      : { action: "REPRIORITIZE_OR_EXTEND_DUE_DATE" },
 
     plan: chosen.timeline
   });
