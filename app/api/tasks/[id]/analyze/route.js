@@ -9,27 +9,17 @@ const supabase = createClient(
 );
 
 /* ================= ID RESOLUTION ================= */
-/**
- * Correct for:
- * /api/tasks/:id/analyze
- *
- * Example pathname:
- * ["", "api", "tasks", "<TASK_ID>", "analyze"]
- */
 function resolveTaskId(request, ctx) {
   if (ctx?.params?.id) return ctx.params.id;
-
   const parts = new URL(request.url).pathname.split("/");
-  return parts[parts.length - 2];
+  return parts[parts.length - 2]; // /tasks/:id/analyze
 }
 
-/* ================= CONFIG ================= */
+/* ================= TIME CONFIG ================= */
 
 const IST_OFFSET_MIN = 330;
 const WORK_START = 9;
 const WORK_END = 17;
-
-/* ================= TIME HELPERS ================= */
 
 const toIST = d => new Date(new Date(d).getTime() + IST_OFFSET_MIN * 60000);
 const fromIST = d => new Date(new Date(d).getTime() - IST_OFFSET_MIN * 60000);
@@ -107,32 +97,6 @@ function topoSort(teamWork) {
   return order;
 }
 
-/* ================= BLOCKER DETECTION ================= */
-
-function findBlockingAssignment(plan, committed, dueDateIST) {
-  const latest = Object.values(plan).reduce((a, b) =>
-    new Date(b.end_date) > new Date(a.end_date) ? b : a
-  );
-
-  const plannedEnd = toIST(latest.end_date);
-  if (plannedEnd <= dueDateIST) return null;
-
-  const memberId = latest.assigned_to;
-
-  const blockers = committed
-    .filter(a => a.member_id === memberId)
-    .map(a => ({
-      ...a,
-      start: toIST(a.start_date),
-      end: toIST(a.end_date)
-    }))
-    .filter(a => a.end > toIST(latest.start_date));
-
-  if (blockers.length === 0) return null;
-
-  return blockers.sort((a, b) => b.end - a.end)[0];
-}
-
 /* ================= ANALYZE ================= */
 
 export async function POST(request, ctx) {
@@ -155,7 +119,7 @@ export async function POST(request, ctx) {
   const taskStart = ensureWorkingTime(toIST(task.start_date));
   const dueDateIST = endOfWorkDayIST(task.due_date);
 
-  /* ---------- Fetch module owners ---------- */
+  /* ---------- Fetch owners ---------- */
   const { data: owners = [] } = await supabase
     .from("module_owners")
     .select("team_id, member_id, role")
@@ -188,16 +152,13 @@ export async function POST(request, ctx) {
       task_id,
       start_date,
       end_date,
-      tasks (
-        title,
-        priority
-      )
+      tasks ( title, priority )
     `)
     .eq("status", "committed");
 
   /* ---------- Ownership validation ---------- */
   const missingOwners = Object.keys(task.team_work)
-    .filter(teamId => !ownersByTeam[teamId]?.primary);
+    .filter(tid => !ownersByTeam[tid]?.primary);
 
   if (missingOwners.length > 0) {
     return NextResponse.json({
@@ -213,17 +174,22 @@ export async function POST(request, ctx) {
     });
   }
 
-  /* ---------- Build plans ---------- */
   const order = topoSort(task.team_work);
 
   function earliestAvailability(memberId) {
-    const busy = committed
+    const ends = committed
       .filter(a => a.member_id === memberId)
       .map(a => toIST(a.end_date));
-    return busy.length ? maxDate(busy) : taskStart;
+    return ends.length ? maxDate(ends) : taskStart;
   }
 
-  function buildPlan(ownerMap) {
+  /* =========================================================
+     BUILD ALL EXECUTION PATHS
+     ========================================================= */
+
+  const paths = [];
+
+  function buildPath(ownerMap) {
     const timeline = {};
 
     for (const teamId of order) {
@@ -235,15 +201,15 @@ export async function POST(request, ctx) {
         ? maxDate(deps.map(d => toIST(timeline[d].end_date)))
         : taskStart;
 
-      const ownerReady = earliestAvailability(owner);
-      const start = ensureWorkingTime(maxDate([depEnd, ownerReady]));
+      const readyAt = earliestAvailability(owner);
+      const start = ensureWorkingTime(maxDate([depEnd, readyAt]));
       const end = addWorkingHours(start, effort);
 
       timeline[teamId] = {
         team_id: teamId,
-        team_name: teamNameById[teamId] || null,
+        team_name: teamNameById[teamId],
         assigned_to: owner,
-        assigned_to_name: memberNameById[owner] || null,
+        assigned_to_name: memberNameById[owner],
         start_date: fromIST(start).toISOString(),
         end_date: fromIST(end).toISOString(),
         effort_hours: effort,
@@ -259,16 +225,13 @@ export async function POST(request, ctx) {
     return { timeline, delivery };
   }
 
-  const paths = [];
-  const teamsInOrder = order;
-
   function generate(idx, map) {
-    if (idx === teamsInOrder.length) {
-      paths.push(buildPlan(map));
+    if (idx === order.length) {
+      paths.push(buildPath(map));
       return;
     }
 
-    const teamId = teamsInOrder[idx];
+    const teamId = order[idx];
     const { primary, secondary } = ownersByTeam[teamId];
 
     generate(idx + 1, { ...map, [teamId]: primary });
@@ -279,69 +242,89 @@ export async function POST(request, ctx) {
 
   generate(0, {});
 
-  const allPrimary = paths.find(p =>
+  /* =========================================================
+     PATH SELECTION (SPEC ORDER)
+     ========================================================= */
+
+  const allPrimaryPath = paths.find(p =>
     Object.values(p.timeline).every(t => t.owner_type === "primary")
   );
 
-  let chosen;
+  let chosenPath;
   let feasible = false;
 
-  if (allPrimary && allPrimary.delivery <= dueDateIST) {
-    chosen = allPrimary;
+  if (allPrimaryPath && allPrimaryPath.delivery <= dueDateIST) {
+    chosenPath = allPrimaryPath;
     feasible = true;
   } else {
     const fitting = paths.filter(p => p.delivery <= dueDateIST);
-    if (fitting.length) {
-      chosen = fitting.sort((a, b) => a.delivery - b.delivery)[0];
+    if (fitting.length > 0) {
+      chosenPath = fitting.sort((a, b) => a.delivery - b.delivery)[0];
       feasible = true;
     } else {
-      chosen = paths.sort((a, b) => a.delivery - b.delivery)[0];
+      chosenPath = paths.sort((a, b) => a.delivery - b.delivery)[0];
     }
   }
 
-  const blocker = !feasible
-    ? findBlockingAssignment(chosen.timeline, committed, dueDateIST)
-    : null;
+  /* =========================================================
+     BLOCKING EXPLANATION (ONLY IF INFEASIBLE)
+     DERIVED FROM ALL-PRIMARY PATH
+     ========================================================= */
+
+  let blocking = null;
+
+  if (!feasible && allPrimaryPath) {
+    for (const t of Object.values(allPrimaryPath.timeline)) {
+      const owner = t.assigned_to;
+      const readyAt = earliestAvailability(owner);
+
+      const blocker = committed
+        .filter(a => a.member_id === owner)
+        .map(a => ({ ...a, end: toIST(a.end_date) }))
+        .find(a => a.end.getTime() === readyAt.getTime());
+
+      if (blocker) {
+        blocking = { blocker, team: t };
+        break;
+      }
+    }
+  }
+
+  /* =========================================================
+     RESPONSE
+     ========================================================= */
 
   return NextResponse.json({
     feasible,
-    estimated_delivery: fromIST(chosen.delivery).toISOString(),
+    estimated_delivery: fromIST(chosenPath.delivery).toISOString(),
 
     blocking_reason: feasible
       ? null
-      : blocker
-        ? {
-            type: "CAPACITY_CONFLICT",
-            blocking_team_id: Object.values(chosen.timeline)
-              .find(t => t.assigned_to === blocker.member_id)?.team_id,
-            blocking_team_name: teamNameById[
-              Object.values(chosen.timeline)
-                .find(t => t.assigned_to === blocker.member_id)?.team_id
-            ],
-            blocking_member_id: blocker.member_id,
-            blocking_member_name: memberNameById[blocker.member_id],
-            blocking_task_id: blocker.task_id,
-            blocking_task_title: blocker.tasks?.title ?? null,
-            blocking_task_priority: blocker.tasks?.priority ?? null,
-            conflict_window: {
-              from: fromIST(blocker.start).toISOString(),
-              to: fromIST(blocker.end).toISOString()
-            },
-            explanation:
-              `${memberNameById[blocker.member_id]} is committed to ` +
-              `'${blocker.tasks?.title}' during the required execution window, ` +
-              `pushing completion beyond the due date.`
-          }
-        : {
-            type: "CAPACITY_CONFLICT",
-            explanation:
-              "Existing committed work blocks the required execution window."
-          },
+      : {
+          type: "CAPACITY_CONFLICT",
+          blocking_team_id: blocking?.team.team_id ?? null,
+          blocking_team_name: blocking
+            ? teamNameById[blocking.team.team_id]
+            : null,
+          blocking_member_id: blocking?.blocker.member_id ?? null,
+          blocking_member_name: blocking
+            ? memberNameById[blocking.blocker.member_id]
+            : null,
+          blocking_task_id: blocking?.blocker.task_id ?? null,
+          blocking_task_title: blocking?.blocker.tasks?.title ?? null,
+          blocking_task_priority: blocking?.blocker.tasks?.priority ?? null,
+          conflict_window: blocking
+            ? {
+                from: blocking.blocker.start_date,
+                to: blocking.blocker.end_date
+              }
+            : null
+        },
 
     recommendation: feasible
       ? null
       : { action: "REPRIORITIZE_OR_EXTEND_DUE_DATE" },
 
-    plan: chosen.timeline
+    plan: chosenPath.timeline
   });
 }
