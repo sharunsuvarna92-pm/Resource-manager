@@ -3,14 +3,12 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-/* ================= SUPABASE ================= */
-
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ================= TIME CONFIG ================= */
+/* ================= CONFIG ================= */
 
 const IST_OFFSET_MIN = 330;
 const WORK_START = 9;
@@ -75,7 +73,7 @@ function endOfWorkDayIST(date) {
   return d;
 }
 
-/* ================= DEPENDENCY SORT ================= */
+/* ================= TOPO SORT ================= */
 
 function topoSort(teamWork) {
   const visited = new Set();
@@ -94,18 +92,36 @@ function topoSort(teamWork) {
   return order;
 }
 
-/* ================= TASK ID ================= */
+/* ================= BLOCKER DETECTION ================= */
 
-function resolveTaskId(request, ctx) {
-  if (ctx?.params?.id) return ctx.params.id;
-  const parts = new URL(request.url).pathname.split("/");
-  return parts[parts.length - 2];
+function findBlockingAssignment(plan, committed, dueDateIST) {
+  const latest = Object.values(plan).reduce((a, b) =>
+    new Date(b.end_date) > new Date(a.end_date) ? b : a
+  );
+
+  const plannedEnd = toIST(latest.end_date);
+  if (plannedEnd <= dueDateIST) return null;
+
+  const memberId = latest.assigned_to;
+
+  const blockers = committed
+    .filter(a => a.member_id === memberId)
+    .map(a => ({
+      ...a,
+      start: toIST(a.start_date),
+      end: toIST(a.end_date)
+    }))
+    .filter(a => a.end > toIST(latest.start_date));
+
+  if (blockers.length === 0) return null;
+
+  return blockers.sort((a, b) => b.end - a.end)[0];
 }
 
 /* ================= ANALYZE ================= */
 
-export async function POST(request, ctx) {
-  const taskId = resolveTaskId(request, ctx);
+export async function POST(req, { params }) {
+  const taskId = params?.id;
 
   /* ---------- Fetch task ---------- */
   const { data: task } = await supabase
@@ -122,9 +138,9 @@ export async function POST(request, ctx) {
   }
 
   const taskStart = ensureWorkingTime(toIST(task.start_date));
-  const dueDate = endOfWorkDayIST(task.due_date);
+  const dueDateIST = endOfWorkDayIST(task.due_date);
 
-  /* ---------- Fetch owners ---------- */
+  /* ---------- Fetch module owners ---------- */
   const { data: owners = [] } = await supabase
     .from("module_owners")
     .select("team_id, member_id, role")
@@ -136,10 +152,11 @@ export async function POST(request, ctx) {
       ownersByTeam[o.team_id] = { primary: null, secondary: [] };
     }
     if (o.role === "PRIMARY") ownersByTeam[o.team_id].primary = o.member_id;
-    if (o.role === "SECONDARY") ownersByTeam[o.team_id].secondary.push(o.member_id);
+    if (o.role === "SECONDARY")
+      ownersByTeam[o.team_id].secondary.push(o.member_id);
   });
 
-  /* ---------- Lookups ---------- */
+  /* ---------- Lookup tables ---------- */
   const [{ data: teams = [] }, { data: members = [] }] = await Promise.all([
     supabase.from("teams").select("id, name"),
     supabase.from("team_members").select("id, name")
@@ -153,77 +170,67 @@ export async function POST(request, ctx) {
     .from("assignments")
     .select(`
       member_id,
+      task_id,
       start_date,
       end_date,
-      task_id,
-      tasks ( title, priority )
+      tasks (
+        title,
+        priority
+      )
     `)
     .eq("status", "committed");
 
-  /* ---------- Dependency order ---------- */
+  /* ---------- Ownership validation ---------- */
+  const missingOwners = Object.keys(task.team_work)
+    .filter(teamId => !ownersByTeam[teamId]?.primary);
+
+  if (missingOwners.length > 0) {
+    return NextResponse.json({
+      feasible: false,
+      blocking_reason: {
+        type: "OWNERSHIP_MISSING",
+        teams: missingOwners.map(tid => ({
+          team_id: tid,
+          team_name: teamNameById[tid] || null
+        }))
+      },
+      recommendation: {
+        action: "ASSIGN_PRIMARY_OWNER"
+      }
+    });
+  }
+
+  /* ---------- Build execution paths ---------- */
   const order = topoSort(task.team_work);
 
   function earliestAvailability(memberId) {
-    const memberAssignments = committed
+    const busy = committed
       .filter(a => a.member_id === memberId)
-      .sort((a, b) => new Date(b.end_date) - new Date(a.end_date));
-
-    return memberAssignments.length
-      ? {
-          availableAt: toIST(memberAssignments[0].end_date),
-          blocking: memberAssignments[0]
-        }
-      : {
-          availableAt: taskStart,
-          blocking: null
-        };
+      .map(a => toIST(a.end_date));
+    return busy.length ? maxDate(busy) : taskStart;
   }
 
   function buildPlan(ownerMap) {
     const timeline = {};
-    let criticalBlocker = null;
 
     for (const teamId of order) {
       const effort = task.team_work[teamId].effort_hours;
-      const dependsOn = task.team_work[teamId].depends_on || [];
+      const deps = task.team_work[teamId].depends_on || [];
       const owner = ownerMap[teamId];
 
-      const depEnd = dependsOn.length
-        ? maxDate(dependsOn.map(d => toIST(timeline[d].end_date)))
+      const depEnd = deps.length
+        ? maxDate(deps.map(d => toIST(timeline[d].end_date)))
         : taskStart;
 
-      const availability = earliestAvailability(owner);
-      const start = ensureWorkingTime(
-        maxDate([depEnd, availability.availableAt])
-      );
-
+      const ownerReady = earliestAvailability(owner);
+      const start = ensureWorkingTime(maxDate([depEnd, ownerReady]));
       const end = addWorkingHours(start, effort);
-
-      if (
-        end > dueDate &&
-        availability.blocking &&
-        !criticalBlocker
-      ) {
-        criticalBlocker = {
-          team_id: teamId,
-          team_name: teamNameById[teamId],
-          member_id: owner,
-          member_name: memberNameById[owner],
-          task_id: availability.blocking.task_id,
-          task_title: availability.blocking.tasks?.title,
-          task_priority: availability.blocking.tasks?.priority,
-          conflict_window: {
-            from: availability.blocking.start_date,
-            to: availability.blocking.end_date
-          }
-        };
-      }
 
       timeline[teamId] = {
         team_id: teamId,
-        team_name: teamNameById[teamId],
+        team_name: teamNameById[teamId] || null,
         assigned_to: owner,
-        assigned_to_name: memberNameById[owner],
+        assigned_to_name: memberNameById[owner] || null,
         start_date: fromIST(start).toISOString(),
         end_date: fromIST(end).toISOString(),
         effort_hours: effort,
@@ -236,21 +243,22 @@ export async function POST(request, ctx) {
       Object.values(timeline).map(t => toIST(t.end_date))
     );
 
-    return { timeline, delivery, blocker: criticalBlocker };
+    return { timeline, delivery };
   }
 
-  /* ---------- Generate paths ---------- */
+  const teamsInOrder = order;
   const paths = [];
+
   function generate(idx, map) {
-    if (idx === order.length) {
+    if (idx === teamsInOrder.length) {
       paths.push(buildPlan(map));
       return;
     }
 
-    const teamId = order[idx];
+    const teamId = teamsInOrder[idx];
     const { primary, secondary } = ownersByTeam[teamId];
 
-    if (primary) generate(idx + 1, { ...map, [teamId]: primary });
+    generate(idx + 1, { ...map, [teamId]: primary });
     secondary.forEach(sec =>
       generate(idx + 1, { ...map, [teamId]: sec })
     );
@@ -258,36 +266,71 @@ export async function POST(request, ctx) {
 
   generate(0, {});
 
-  /* ---------- Choose path ---------- */
-  const fitting = paths.filter(p => p.delivery <= dueDate);
+  const allPrimary = paths.find(p =>
+    Object.values(p.timeline).every(t => t.owner_type === "primary")
+  );
 
   let chosen;
   let feasible = false;
 
-  if (fitting.length) {
-    chosen = fitting.sort((a, b) => a.delivery - b.delivery)[0];
+  if (allPrimary && allPrimary.delivery <= dueDateIST) {
+    chosen = allPrimary;
     feasible = true;
   } else {
-    chosen = paths.sort((a, b) => a.delivery - b.delivery)[0];
+    const fitting = paths.filter(p => p.delivery <= dueDateIST);
+    if (fitting.length) {
+      chosen = fitting.sort((a, b) => a.delivery - b.delivery)[0];
+      feasible = true;
+    } else {
+      chosen = paths.sort((a, b) => a.delivery - b.delivery)[0];
+    }
   }
 
-  /* ---------- Response ---------- */
+  const blocker = !feasible
+    ? findBlockingAssignment(chosen.timeline, committed, dueDateIST)
+    : null;
+
   return NextResponse.json({
     feasible,
     estimated_delivery: fromIST(chosen.delivery).toISOString(),
+
     blocking_reason: feasible
       ? null
-      : {
-          type: "CAPACITY_CONFLICT",
-          ...chosen.blocker,
-          explanation:
-            "Existing committed work blocks the required execution window, pushing completion beyond the due date."
-        },
+      : blocker
+        ? {
+            type: "CAPACITY_CONFLICT",
+            blocking_team_id: Object.values(chosen.timeline)
+              .find(t => t.assigned_to === blocker.member_id)?.team_id,
+            blocking_team_name: teamNameById[
+              Object.values(chosen.timeline)
+                .find(t => t.assigned_to === blocker.member_id)?.team_id
+            ],
+            blocking_member_id: blocker.member_id,
+            blocking_member_name: memberNameById[blocker.member_id],
+            blocking_task_id: blocker.task_id,
+            blocking_task_title: blocker.tasks?.title ?? null,
+            blocking_task_priority: blocker.tasks?.priority ?? null,
+            conflict_window: {
+              from: fromIST(blocker.start).toISOString(),
+              to: fromIST(blocker.end).toISOString()
+            },
+            explanation:
+              `${memberNameById[blocker.member_id]} is committed to ` +
+              `'${blocker.tasks?.title}' during the required execution window, ` +
+              `pushing completion beyond the due date.`
+          }
+        : {
+            type: "CAPACITY_CONFLICT",
+            explanation:
+              "Existing committed work blocks the required execution window."
+          },
+
     recommendation: feasible
       ? null
       : {
           action: "REPRIORITIZE_OR_EXTEND_DUE_DATE"
         },
+
     plan: chosen.timeline
   });
 }
