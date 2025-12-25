@@ -2,112 +2,120 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-/* ================= SUPABASE ================= */
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ================= CORS ================= */
-function corsHeaders(request) {
-  const origin = request.headers.get("origin") || "*";
+/* ================= ID RESOLUTION ================= */
 
-  return {
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization, Accept",
-  };
+function resolveModuleId(request, ctx) {
+  if (ctx?.params?.id) return ctx.params.id;
+
+  const parts = new URL(request.url).pathname.split("/");
+  return parts[parts.length - 1];
 }
 
-/* ================= OPTIONS ================= */
-export async function OPTIONS(request) {
-  return new Response(null, {
-    status: 204,
-    headers: corsHeaders(request),
-  });
-}
+/* ================= UPDATE MODULE ================= */
 
-/* ================= CORE UPDATE ================= */
-async function handleUpdate(request, params) {
-  const moduleId = params?.id;
+export async function PATCH(request, ctx) {
+  const moduleId = resolveModuleId(request, ctx);
 
   if (!moduleId) {
     return new Response(
-      JSON.stringify({ error: "Module ID missing" }),
-      { status: 400, headers: corsHeaders(request) }
+      JSON.stringify({ error: "Missing module ID" }),
+      { status: 400 }
     );
   }
 
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return new Response(
-      JSON.stringify({ error: "Invalid JSON body" }),
-      { status: 400, headers: corsHeaders(request) }
-    );
-  }
+  const body = await request.json();
+  const { name, description, module_owners } = body;
 
-  const { name, description, owners } = body;
+  /* ---------- Update module metadata ---------- */
+  if (name !== undefined || description !== undefined) {
+    const { error } = await supabase
+      .from("modules")
+      .update({
+        name,
+        description,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", moduleId);
 
-  // ---- Update module metadata (NO STRICT VALIDATION) ----
-  const { error: moduleError } = await supabase
-    .from("modules")
-    .update({
-      name,
-      description,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", moduleId);
-
-  if (moduleError) {
-    return new Response(
-      JSON.stringify({ error: moduleError.message }),
-      { status: 500, headers: corsHeaders(request) }
-    );
-  }
-
-  // ---- Replace owners (best-effort) ----
-  await supabase
-    .from("module_owners")
-    .delete()
-    .eq("module_id", moduleId);
-
-  if (Array.isArray(owners) && owners.length > 0) {
-    const rows = owners.map(o => ({
-      module_id: moduleId,
-      team_id: o.team_id,
-      member_id: o.member_id,
-      role: o.role,
-      created_at: new Date().toISOString(),
-    }));
-
-    const { error: ownerError } = await supabase
-      .from("module_owners")
-      .insert(rows);
-
-    if (ownerError) {
+    if (error) {
       return new Response(
-        JSON.stringify({ error: ownerError.message }),
-        { status: 500, headers: corsHeaders(request) }
+        JSON.stringify({ error: error.message }),
+        { status: 500 }
       );
     }
   }
 
+  /* ---------- Replace module owners ---------- */
+  if (Array.isArray(module_owners)) {
+    // 🔒 Invariant validation
+    const primaryByTeam = {};
+
+    for (const o of module_owners) {
+      if (!o.team_id || !o.member_id || !o.role) {
+        return new Response(
+          JSON.stringify({ error: "Invalid module_owners payload" }),
+          { status: 400 }
+        );
+      }
+
+      if (o.role === "PRIMARY") {
+        if (primaryByTeam[o.team_id]) {
+          return new Response(
+            JSON.stringify({
+              error:
+                "Exactly one PRIMARY owner is allowed per (module, team)"
+            }),
+            { status: 400 }
+          );
+        }
+        primaryByTeam[o.team_id] = true;
+      }
+    }
+
+    // 1️⃣ Delete existing owners
+    await supabase
+      .from("module_owners")
+      .delete()
+      .eq("module_id", moduleId);
+
+    // 2️⃣ Insert new owners exactly as sent
+    const rows = module_owners.map(o => ({
+      module_id: moduleId,
+      team_id: o.team_id,
+      member_id: o.member_id,
+      role: o.role,
+      created_at: new Date().toISOString()
+    }));
+
+    if (rows.length > 0) {
+      const { error } = await supabase
+        .from("module_owners")
+        .insert(rows);
+
+      if (error) {
+        return new Response(
+          JSON.stringify({ error: error.message }),
+          { status: 500 }
+        );
+      }
+    }
+  }
+
   return new Response(
-    JSON.stringify({ success: true, module_id: moduleId }),
-    { status: 200, headers: corsHeaders(request) }
+    JSON.stringify({
+      success: true,
+      module_id: moduleId
+    }),
+    { status: 200 }
   );
 }
 
-/* ================= PUT ================= */
+/* PUT alias (safe) */
 export async function PUT(request, ctx) {
-  return handleUpdate(request, ctx.params);
-}
-
-/* ================= PATCH ================= */
-export async function PATCH(request, ctx) {
-  return handleUpdate(request, ctx.params);
+  return PATCH(request, ctx);
 }
