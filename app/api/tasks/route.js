@@ -32,16 +32,42 @@ export async function POST(request) {
 }
 
 export async function GET() {
-  const { data, error } = await supabase
-    .from("tasks")
-    .select(
-      "id, title, status, start_date, due_date, expected_delivery_date, priority"
-    )
-    .order("created_at", { ascending: false });
+  try {
+    const { data, error } = await supabase
+      .from("tasks")
+      .select(`
+        id,
+        title,
+        description,
+        status,
+        start_date,
+        due_date,
+        expected_delivery_date,
+        module_id,
+        teams_involved,
+        team_work,
+        priority,
+        created_at
+      `)
+      .order("created_at", { ascending: false });
 
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    if (error) {
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500 }
+      );
+    }
+
+    return new Response(
+      JSON.stringify({ tasks: data }),
+      { status: 200 }
+    );
+
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ error: "Failed to fetch tasks" }),
+      { status: 500 }
+    );
   }
-
-  return NextResponse.json({ tasks: data });
 }
+
