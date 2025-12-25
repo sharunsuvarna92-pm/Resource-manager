@@ -8,6 +8,19 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+/* ================= ID RESOLUTION ================= */
+/**
+ * Works reliably for:
+ * /api/tasks/:id/analyze
+ */
+function resolveTaskId(request, ctx) {
+  if (ctx?.params?.id) return ctx.params.id;
+
+  const parts = new URL(request.url).pathname.split("/");
+  // ["", "api", "tasks", "<TASK_ID>", "analyze"]
+  return parts[parts.length - 3];
+}
+
 /* ================= CONFIG ================= */
 
 const IST_OFFSET_MIN = 330;
@@ -120,8 +133,8 @@ function findBlockingAssignment(plan, committed, dueDateIST) {
 
 /* ================= ANALYZE ================= */
 
-export async function POST(req, { params }) {
-  const taskId = params?.id;
+export async function POST(request, ctx) {
+  const taskId = resolveTaskId(request, ctx);
 
   /* ---------- Fetch task ---------- */
   const { data: task } = await supabase
@@ -246,8 +259,8 @@ export async function POST(req, { params }) {
     return { timeline, delivery };
   }
 
-  const teamsInOrder = order;
   const paths = [];
+  const teamsInOrder = order;
 
   function generate(idx, map) {
     if (idx === teamsInOrder.length) {
