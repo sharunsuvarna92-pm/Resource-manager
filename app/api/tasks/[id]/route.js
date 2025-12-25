@@ -1,4 +1,3 @@
-// app/api/tasks/[id]/route.js
 import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
@@ -7,6 +6,15 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+/* ================= ID RESOLUTION ================= */
+function resolveTaskId(request, ctx) {
+  if (ctx?.params?.id) return ctx.params.id;
+
+  // Fallback for App Router + external clients (AI Studio, etc.)
+  const parts = new URL(request.url).pathname.split("/");
+  return parts[parts.length - 1]; // /api/tasks/:id
+}
 
 function withCors(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -30,9 +38,9 @@ export function OPTIONS() {
  * ❌ Status changes NOT allowed
  * ❌ Assignment changes NOT allowed
  */
-export async function PATCH(request, { params }) {
+export async function PATCH(request, ctx) {
   try {
-    const { id: taskId } = params;
+    const taskId = resolveTaskId(request, ctx);
     const body = await request.json();
 
     if (!taskId) {
